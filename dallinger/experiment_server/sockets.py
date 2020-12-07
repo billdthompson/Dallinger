@@ -57,6 +57,7 @@ class Channel(object):
                         "participant_id": client.participant_id
                     }),
                 )
+            gevent.sleep(0.001)
 
     def listen(self):
         """Relay messages from a redis pubsub to all subscribed clients.
