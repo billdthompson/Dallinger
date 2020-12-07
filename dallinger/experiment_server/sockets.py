@@ -12,6 +12,7 @@ import gevent
 import os
 import six
 import socket
+import json
 
 sockets = Sockets(app)
 
@@ -43,11 +44,19 @@ class Channel(object):
         self.clients.append(client)
         log("Subscribed client {} to channel {}".format(client, self.name))
 
-    def unsubscribe(self, client):
+    def unsubscribe(self, client, dropped=False):
         """Unsubscribe a client from the channel."""
         if client in self.clients:
             self.clients.remove(client)
             log("Unsubscribed client {} from channel {}".format(client, self.name))
+            if client.participant_id and dropped:
+                redis_conn.publish(
+                    self.name,
+                    json.dumps({
+                        "type": "disconnect",
+                        "participant_id": client.participant_id
+                    }),
+                )
 
     def listen(self):
         """Relay messages from a redis pubsub to all subscribed clients.
@@ -97,10 +106,10 @@ class ChatBackend(object):
 
         self.channels[channel_name].subscribe(client)
 
-    def unsubscribe(self, client):
+    def unsubscribe(self, client, dropped=False):
         """Unsubscribe a client from all channels."""
         for channel in self.channels.values():
-            channel.unsubscribe(client)
+            channel.unsubscribe(client, dropped=dropped)
 
 
 # There is one chat backend per process.
@@ -113,6 +122,7 @@ class Client(object):
     def __init__(self, ws, lag_tolerance_secs=0.1):
         self.ws = ws
         self.lag_tolerance_secs = lag_tolerance_secs
+        self.participant_id = ""
 
         # This lock is used to make sure that multiple greenlets
         # cannot send to the same socket concurrently.
@@ -127,7 +137,7 @@ class Client(object):
             try:
                 self.ws.send(message)
             except socket.error:
-                chat_backend.unsubscribe(self)
+                chat_backend.unsubscribe(self, dropped=True)
             # log('Sent to {}: {}'.format(self, message), level='debug')
 
     def heartbeat(self):
@@ -153,7 +163,9 @@ class Client(object):
             if message is not None:
                 channel_name, data = message.split(":", 1)
                 redis_conn.publish(channel_name, data)
-
+                parsed_data = json.loads(data)
+                if parsed_data["type"] == "connect":
+                    self.participant_id = parsed_data["participant_id"]
 
 @sockets.route("/chat")
 def chat(ws):
