@@ -59,6 +59,41 @@ class Channel(object):
                 )
             gevent.sleep(0.001)
 
+    def remove_client(self, parsed_data, channel):
+        """
+        Remove a client from the Channel's clients
+        upon intercepting an unsubscribe message.
+        Allows the frontend to inform the server that
+        the client is disconnecting from a specific channel,
+        without triggering events that are triggered in
+        response to heartbeat-based disconnects.
+        """
+        log(
+            "Removing client for p={} from channel: {}"
+            .format(
+                parsed_data["participant_id"],
+                channel
+            )
+        )
+        def is_leaving(client, idx):
+            """
+            avoid checking participant id attribute
+            on objects that dont have one.
+            """
+            if not hasattr(client, "participant_id"):
+                return False
+            return client.participant_id == idx
+        
+        self.clients = [
+            client for client
+            in self.clients
+            if not is_leaving(
+                client,
+                parsed_data["participant_id"]
+            )
+        ]
+
+
     def listen(self):
         """Relay messages from a redis pubsub to all subscribed clients.
 
@@ -80,21 +115,13 @@ class Channel(object):
                 payload = "{}:{}".format(channel.decode("utf-8"), data.decode("utf-8"))
                 parsed_data = json.loads(data)
                 if parsed_data["type"] == "unsubscribe":
-                    log(
-                        "Removing client for p={} from channel: {}"
-                        .format(
-                            parsed_data["participant_id"],
-                            channel
-                        )
+                    self.remove_client(
+                        parsed_data,
+                        channel
                     )
-                    self.clients = [
-                        client for client
-                        in self.clients
-                        if client.participant_id
-                        != parsed_data["participant_id"]
-                    ]
-                for client in self.clients:
-                    gevent.spawn(client.send, payload)
+                else:
+                    for client in self.clients:
+                        gevent.spawn(client.send, payload)
             gevent.sleep(0.001)
 
     def start(self):
