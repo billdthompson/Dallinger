@@ -78,6 +78,21 @@ class Channel(object):
             if message["type"] == "message" and data != "None":
                 channel = message["channel"]
                 payload = "{}:{}".format(channel.decode("utf-8"), data.decode("utf-8"))
+                parsed_data = json.loads(data)
+                if parsed_data["type"] == "unsubscribe":
+                    log(
+                        "Removing client for p={} from channel: {}"
+                        .format(
+                            parsed_data["participant_id"],
+                            channel
+                        )
+                    )
+                    self.clients = [
+                        client for client
+                        in self.clients
+                        if client.participant_id
+                        != parsed_data["participant_id"]
+                    ]
                 for client in self.clients:
                     gevent.spawn(client.send, payload)
             gevent.sleep(0.001)
