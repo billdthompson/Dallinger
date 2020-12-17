@@ -25,17 +25,21 @@ from rq import Worker, Connection
 from dallinger.config import get_config
 from dallinger.config import initialize_experiment_package
 from dallinger import data
-from dallinger.db import redis_conn
-from dallinger.deployment import _deploy_in_mode
+from dallinger import db
+from dallinger.deployment import deploy_sandbox_shared_setup
 from dallinger.deployment import DebugDeployment
 from dallinger.deployment import LoaderDeployment
 from dallinger.deployment import setup_experiment
-from dallinger.deployment import size_on_copy
-from dallinger.notifications import get_messenger
+from dallinger.deployment import ExperimentFileSource
+from dallinger.notifications import admin_notifier
+from dallinger.notifications import SMTPMailer
+from dallinger.notifications import EmailConfig
+from dallinger.notifications import MessengerError
 from dallinger.heroku.tools import HerokuApp
 from dallinger.heroku.tools import HerokuInfo
 from dallinger.mturk import MTurkService
 from dallinger.mturk import MTurkServiceException
+from dallinger.recruiters import by_name
 from dallinger.utils import check_call
 from dallinger.utils import generate_random_id
 from dallinger.version import __version__
@@ -58,30 +62,30 @@ header = r"""
 )
 
 
-def log(msg, delay=0.5, chevrons=True, verbose=True):
+def log(msg, chevrons=True, verbose=True, **kw):
     """Log a message to stdout."""
     if verbose:
         if chevrons:
-            click.echo("\n❯❯ " + msg)
+            click.echo("\n❯❯ " + msg, **kw)
         else:
-            click.echo(msg)
-        time.sleep(delay)
+            click.echo(msg, **kw)
 
 
-def error(msg, delay=0.5, chevrons=True, verbose=True):
+def error(msg, chevrons=True, verbose=True):
     """Log a message to stdout."""
     if verbose:
         if chevrons:
             click.secho("\n❯❯ " + msg, err=True, fg="red")
         else:
             click.secho(msg, err=True, fg="red")
-        time.sleep(delay)
 
 
 class Output(object):
-    def __init__(self, log=log, error=error, blather=sys.stdout.write):
+    def __init__(self, log=log, error=error, blather=None):
         self.log = log
         self.error = error
+        if blather is None:
+            blather = sys.stdout.write
         self.blather = blather
 
 
@@ -117,7 +121,7 @@ def report_idle_after(seconds):
                     ),
                 }
                 log("Reporting problem with idle experiment...")
-                get_messenger(config).send(message)
+                admin_notifier(config).send(**message)
 
             signal.signal(signal.SIGALRM, _handle_timeout)
             signal.alarm(seconds)
@@ -163,11 +167,14 @@ def verify_directory(verbose=True, max_size_mb=50):
 
     # Check size
     max_size = max_size_mb * mb_to_bytes
-    size = size_on_copy()
+    file_source = ExperimentFileSource(os.getcwd())
+    size = file_source.size
     if size > max_size:
         size_in_mb = round(size / mb_to_bytes)
         log(
-            "✗ {}MB is TOO BIG (greater than {}MB)".format(size_in_mb, max_size_mb),
+            "✗ {}MB is TOO BIG (greater than {}MB)\n\tIncluded files:\n\t{}".format(
+                size_in_mb, max_size_mb, "\n\t".join(file_source.files)
+            ),
             chevrons=False,
             verbose=verbose,
         )
@@ -187,10 +194,7 @@ def verify_experiment_module(verbose):
     temp_package_name = "TEMP_VERIFICATION_PACKAGE"
     tmp = tempfile.mkdtemp()
     clone_dir = os.path.join(tmp, temp_package_name)
-    to_ignore = shutil.ignore_patterns(
-        os.path.join(".git", "*"), "*.db", "snapshots", "data", "server.log"
-    )
-    shutil.copytree(os.getcwd(), clone_dir, ignore=to_ignore)
+    ExperimentFileSource(os.getcwd()).selective_copy_to(clone_dir)
     initialize_experiment_package(clone_dir)
     from dallinger_experiment import experiment
 
@@ -207,22 +211,17 @@ def verify_experiment_module(verbose):
     if len(exps) == 0:
         log(
             "✗ experiment.py does not define an experiment class.",
-            delay=0,
             chevrons=False,
             verbose=verbose,
         )
         ok = False
     elif len(exps) == 1:
         log(
-            "✓ experiment.py defines 1 experiment",
-            delay=0,
-            chevrons=False,
-            verbose=verbose,
+            "✓ experiment.py defines 1 experiment", chevrons=False, verbose=verbose,
         )
     else:
         log(
             "✗ experiment.py defines more than one experiment class.",
-            delay=0,
             chevrons=False,
             verbose=verbose,
         )
@@ -237,19 +236,31 @@ def verify_config(verbose=True):
     ok = True
     config = get_config()
     if not config.ready:
-        config.load()
+        try:
+            config.load()
+        except ValueError as e:
+            config_key = getattr(e, "dallinger_config_key", None)
+            if config_key is not None:
+                message = "Configuration for {} is invalid: ".format(config_key)
+            else:
+                message = "Configuration is invalid: "
+            log("✗ " + message + str(e), chevrons=False, verbose=verbose)
+
+            config_value = getattr(e, "dallinger_config_value", None)
+            if verbose and config_value:
+                log("  Value supplied was " + config_value, chevrons=False)
+            return False
     # Check base_payment is correct
     try:
         base_pay = config.get("base_payment")
     except KeyError:
-        log("✗ No value for base_pay.", delay=0, chevrons=False, verbose=verbose)
+        log("✗ No value for base_pay.", chevrons=False, verbose=verbose)
     else:
         dollarFormat = "{:.2f}".format(base_pay)
 
         if base_pay <= 0:
             log(
                 "✗ base_payment must be positive value in config.txt.",
-                delay=0,
                 chevrons=False,
                 verbose=verbose,
             )
@@ -259,7 +270,6 @@ def verify_config(verbose=True):
             log(
                 "✗ base_payment must be in [dollars].[cents] format in config.txt. Try changing "
                 "{0} to {1}.".format(base_pay, dollarFormat),
-                delay=0,
                 chevrons=False,
                 verbose=verbose,
             )
@@ -292,14 +302,13 @@ def verify_no_conflicts(verbose=True):
         if os.path.exists(f):
             log(
                 "✗ {} OVERWRITES shared frontend files inserted at run-time".format(f),
-                delay=0,
                 chevrons=False,
                 verbose=verbose,
             )
             conflicts = True
 
     if not conflicts:
-        log("✓ no file conflicts", delay=0, chevrons=False, verbose=verbose)
+        log("✓ no file conflicts", chevrons=False, verbose=verbose)
 
     return True
 
@@ -324,12 +333,16 @@ def require_exp_directory(f):
     """Decorator to verify that a command is run inside a valid Dallinger
     experiment directory.
     """
-    error = "The current directory is not a valid Dallinger experiment."
+    error_one = "The current directory is not a valid Dallinger experiment."
+    error_two = "There are problems with the current experiment. Please check with dallinger verify."
 
     @wraps(f)
     def wrapper(**kwargs):
-        if not verify_directory(kwargs.get("verbose")):
-            raise click.UsageError(error)
+        try:
+            if not verify_package(kwargs.get("verbose")):
+                raise click.UsageError(error_one)
+        except ValueError:
+            raise click.UsageError(error_two)
         return f(**kwargs)
 
     return wrapper
@@ -408,10 +421,17 @@ def get_summary(app):
 @click.option(
     "--proxy", default=None, help="Alternate port when opening browser windows"
 )
+@click.option(
+    "--no-browsers",
+    is_flag=True,
+    flag_value=True,
+    default=False,
+    help="Skip opening browsers",
+)
 @require_exp_directory
-def debug(verbose, bot, proxy, exp_config=None):
+def debug(verbose, bot, proxy, no_browsers=False, exp_config=None):
     """Run the experiment locally."""
-    debugger = DebugDeployment(Output(), verbose, bot, proxy, exp_config)
+    debugger = DebugDeployment(Output(), verbose, bot, proxy, exp_config, no_browsers)
     log(header, chevrons=False)
     debugger.run()
 
@@ -427,30 +447,59 @@ def _mturk_service_from_config(sandbox):
     )
 
 
+def prelaunch_db_bootstrapper(zip_path, log):
+    def bootstrap_db(heroku_app, config):
+        # Pre-populate the database if an archive was given
+        log("Ingesting dataset from {}...".format(os.path.basename(zip_path)))
+        engine = db.create_db_engine(heroku_app.db_url)
+        data.bootstrap_db_from_zip(zip_path, engine)
+
+    return bootstrap_db
+
+
+def _deploy_in_mode(mode, verbose, log, app=None, archive=None):
+    if app:
+        verify_id(None, None, app)
+
+    log(header, chevrons=False)
+    prelaunch = []
+    if archive:
+        archive_path = os.path.abspath(archive)
+        if not os.path.exists(archive_path):
+            raise click.BadParameter(
+                'Experiment archive "{}" does not exist.'.format(archive_path)
+            )
+        prelaunch.append(prelaunch_db_bootstrapper(archive_path, log))
+
+    config = get_config()
+    config.load()
+    config.extend({"mode": mode, "logfile": "-"})
+
+    deploy_sandbox_shared_setup(
+        log=log, verbose=verbose, app=app, prelaunch_actions=prelaunch
+    )
+
+
 @dallinger.command()
 @click.option("--verbose", is_flag=True, flag_value=True, help="Verbose mode")
 @click.option("--app", default=None, help="Experiment id")
+@click.option("--archive", default=None, help="Optional path to an experiment archive")
 @require_exp_directory
 @report_idle_after(21600)
-def sandbox(verbose, app):
+def sandbox(verbose, app, archive):
     """Deploy app using Heroku to the MTurk Sandbox."""
-    if app:
-        verify_id(None, None, app)
-    log(header, chevrons=False)
-    _deploy_in_mode("sandbox", app=app, verbose=verbose, log=log)
+    _deploy_in_mode(mode="sandbox", verbose=verbose, log=log, app=app, archive=archive)
 
 
 @dallinger.command()
 @click.option("--verbose", is_flag=True, flag_value=True, help="Verbose mode")
 @click.option("--app", default=None, help="ID of the deployed experiment")
+@click.option("--archive", default=None, help="Optional path to an experiment archive")
 @require_exp_directory
 @report_idle_after(21600)
-def deploy(verbose, app):
+def deploy(verbose, app, archive):
     """Deploy app using Heroku to MTurk."""
-    if app:
-        verify_id(None, None, app)
-    log(header, chevrons=False)
-    _deploy_in_mode("live", app=app, verbose=verbose, log=log)
+    _deploy_in_mode(mode="live", verbose=verbose, log=log, app=app, archive=archive)
 
 
 @dallinger.command()
@@ -489,7 +538,7 @@ def qualify(workers, qualification, value, by_name, notify, sandbox):
         )
     )
     for worker in workers:
-        if mturk.set_qualification_score(qid, worker, int(value), notify=notify):
+        if mturk.assign_qualification(qid, worker, int(value), notify=notify):
             click.echo("{} OK".format(worker))
 
     # print out the current set of workers with the qualification
@@ -499,6 +548,92 @@ def qualify(workers, qualification, value, by_name, notify, sandbox):
 
     for score, count in Counter([r["score"] for r in results]).items():
         click.echo("{} with value {}".format(count, score))
+
+
+@dallinger.command()
+def email_test():
+    """Test email configuration and send a test email."""
+    out = Output()
+    config = get_config()
+    config.load()
+    settings = EmailConfig(config)
+    out.log("Email Config")
+    out.log(tabulate.tabulate(settings.as_dict().items()), chevrons=False)
+    problems = settings.validate()
+    if problems:
+        out.error(
+            "✗ There are mail configuration problems. Fix these first:\n{}".format(
+                problems
+            )
+        )
+        return
+
+    else:
+        out.log("✓ email config looks good!")
+    mailer = SMTPMailer(
+        config.get("smtp_host"),
+        config.get("smtp_username"),
+        config.get("smtp_password"),
+    )
+    msg = {
+        "subject": "Test message from Dallinger",
+        "sender": config.get("dallinger_email_address"),
+        "recipients": [config.get("contact_email_on_error")],
+        "body": "This has been a test...",
+    }
+    out.log("Sending a test email from {sender} to {recipients[0]}".format(**msg))
+    try:
+        mailer.send(**msg)
+    except MessengerError:
+        out.error("✗ Message sending failed...")
+        raise
+    else:
+        out.log("✓ Test email sent successfully to {}!".format(msg["recipients"][0]))
+
+
+@dallinger.command()
+@click.option("--recruiter", default="mturk", required=True)
+@click.option("--worker_id", required=True)
+@click.option("--email")
+@click.option("--dollars", required=True, type=float)
+@click.option("--sandbox", is_flag=True, flag_value=True, help="Use the MTurk sandbox")
+def compensate(recruiter, worker_id, email, dollars, sandbox):
+    """Credit a specific worker by ID through their recruiter"""
+    out = Output()
+    config = get_config()
+    config.load()
+    mode = "sandbox" if sandbox else "live"
+    do_notify = email is not None
+    no_email_str = "" if email else " NOT"
+
+    with config.override({"mode": mode}):
+        rec = by_name(recruiter)
+        if not click.confirm(
+            '\n\nYou are about to pay worker "{}" ${:.2f} in "{}" mode using the "{}" recruiter.\n'
+            "The worker will{} be notified by email. "
+            "Continue?".format(worker_id, dollars, mode, recruiter, no_email_str)
+        ):
+            out.log("Aborting...")
+            return
+
+        try:
+            result = rec.compensate_worker(
+                worker_id=worker_id, email=email, dollars=dollars, notify=do_notify
+            )
+        except Exception as ex:
+            out.error(
+                "Compensation failed. The recruiter reports the following error:\n{}".format(
+                    ex
+                ),
+            )
+            return
+
+    out.log("HIT Details")
+    out.log(tabulate.tabulate(result["hit"].items()), chevrons=False)
+    out.log("Qualification Details")
+    out.log(tabulate.tabulate(result["qualification"].items()), chevrons=False)
+    out.log("Worker Notification")
+    out.log(tabulate.tabulate(result["email"].items()), chevrons=False)
 
 
 @dallinger.command()
@@ -640,6 +775,45 @@ def expire(app, sandbox, exit=True):
             )
     if exit and not success:
         sys.exit(1)
+
+
+@dallinger.command()
+@click.option("--hit_id", required=True)
+@click.option("--assignments", required=True, type=int)
+@click.option("--duration_hours", type=float)
+@click.option(
+    "--sandbox", is_flag=True, flag_value=True, help="HIT is in the MTurk sandbox"
+)
+def extend_mturk_hit(hit_id, assignments, duration_hours, sandbox):
+    """Add assignments, and optionally time, to an existing MTurk HIT."""
+    out = Output()
+    config = get_config()
+    config.load()
+    mode = "sandbox" if sandbox else "live"
+    assignments_presented = "assignments" if assignments > 1 else "assignment"
+    duration_presented = duration_hours or 0.0
+
+    with config.override({"mode": mode}):
+        if not click.confirm(
+            "\n\nYou are about to add {:.1f} hours and {} {} to {} HIT {}.\n"
+            "Continue?".format(
+                duration_presented, assignments, assignments_presented, mode, hit_id
+            )
+        ):
+            out.log("Aborting...")
+            return
+
+        service = _mturk_service_from_config(sandbox)
+        try:
+            hit_info = service.extend_hit(
+                hit_id=hit_id, number=assignments, duration_hours=duration_hours
+            )
+        except MTurkServiceException as ex:
+            out.error("HIT extension failed with the following error:\n{}".format(ex),)
+            return
+
+    out.log("Updated HIT Details")
+    out.log(tabulate.tabulate(hit_info.items()), chevrons=False)
 
 
 @dallinger.command()
@@ -797,22 +971,20 @@ def verify():
     """Verify that app is compatible with Dallinger."""
     verbose = True
     log(
-        "Verifying current directory as a Dallinger experiment...",
-        delay=0,
-        verbose=verbose,
+        "Verifying current directory as a Dallinger experiment...", verbose=verbose,
     )
     ok = verify_package(verbose=verbose)
     if ok:
-        log("✓ Everything looks good!", delay=0, verbose=verbose)
+        log("✓ Everything looks good!", verbose=verbose)
     else:
-        log("☹ Some problems were found.", delay=0, verbose=verbose)
+        log("☹ Some problems were found.", verbose=verbose)
 
 
 @dallinger.command()
 def rq_worker():
     """Start an rq worker in the context of dallinger."""
     setup_experiment(log)
-    with Connection(redis_conn):
+    with Connection(db.redis_conn):
         # right now we care about low queue for bots
         worker = Worker("low")
         worker.work()

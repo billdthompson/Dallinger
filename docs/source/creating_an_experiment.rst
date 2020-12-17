@@ -279,7 +279,9 @@ There are a few more files in the ``myexperiments.pushbutton`` directory.
 Here is a quick description of each:
 
 - ``.gitignore``. Used by `git` to keep track of which files to ignore
-  when looking for changes in your project.
+  when looking for changes in your project. Files ignored by `git` will
+  also be ignored both when deploying your experiment, and when testing it
+  in debug mode.
 - ``.travis.yml``. Travis is a continuous integration service, which can
   run your experiment's tests each time you push some changes. This is
   the configuration file where this is set up.
@@ -539,6 +541,10 @@ experiment code. It inherits its behavior from Dallinger's
 very simple experiment, we don't have a lot of custom code here,
 other than setting up initial values for our custom parameters in
 the `configure` method.
+
+It's best to limit yourself to one experiment subclass, but if this
+isn't possible, you can set the EXPERIMENT_CLASS_NAME environment
+variable to choose which is being used.
 
 If you had a class defined somewhere else representing some objects
 in your experiment, the place to initialize an instance would be the

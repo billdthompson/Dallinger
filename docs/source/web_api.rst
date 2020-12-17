@@ -69,6 +69,9 @@ must be passed as data. ``info_type`` can be passed as data and will
 cause the info to be of the specified type. Also calls experiment method
 ``info_post_request(node, info)``.
 
+If the specified node is failed then this will fail unless ``failed`` is
+also passed with the value True. This will create a failed Info on the node.
+
 ::
 
     POST /launch
@@ -230,7 +233,15 @@ Returns a JSON description of the requested participant as
     POST /participant/<worker_id>/<hit_id>/<assignment_id>/<mode>
 
 Create a participant. Returns a JSON description of the participant as
-``participant``.
+``participant``. Delegates participant creation to
+:func:`~dallinger.experiment.Experiment.create_participant`
+
+::
+
+    POST /participant
+
+Loads a participant from a running experiment by ``assignment_id`` and
+returns a JSON description. ``assignment_id`` should be passed as data.
 
 ::
 

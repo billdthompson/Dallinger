@@ -17,10 +17,12 @@ from dallinger.experiment_server.utils import success_response
 from dallinger.experiment_server.utils import crossdomain
 from dallinger.experiment_server.worker_events import worker_function
 from dallinger.heroku import tools as heroku_tools
-from dallinger.notifications import get_messenger
+from dallinger.notifications import get_mailer
+from dallinger.notifications import admin_notifier
 from dallinger.notifications import MessengerError
-from dallinger.models import Participant
 from dallinger.models import Recruitment
+from dallinger.mturk import MTurkQualificationRequirements
+from dallinger.mturk import MTurkQuestions
 from dallinger.mturk import MTurkService
 from dallinger.mturk import DuplicateQualificationNameError
 from dallinger.mturk import MTurkServiceException
@@ -80,6 +82,11 @@ class Recruiter(object):
 
     def close_recruitment(self):
         """Throw an error."""
+        raise NotImplementedError
+
+    def compensate_worker(self, *args, **kwargs):
+        """A recruiter may provide a means to directly compensate a worker.
+        """
         raise NotImplementedError
 
     def reward_bonus(self, assignment_id, amount, reason):
@@ -449,7 +456,8 @@ class MTurkRecruiter(Recruiter):
             region_name=self.config.get("aws_region"),
             sandbox=self.config.get("mode") != "live",
         )
-        self.messenger = get_messenger(self.config)
+        self.notifies_admin = admin_notifier(self.config)
+        self.mailer = get_mailer(self.config)
         self._validate_config()
 
     def _validate_config(self):
@@ -466,7 +474,7 @@ class MTurkRecruiter(Recruiter):
         the Mechanical Turk site to submit their HIT, which in turn triggers
         notifications to the /notifications route.
         """
-        if self.config.get("mode") == "sandbox":
+        if self.is_sandbox:
             return "https://workersandbox.mturk.com/mturk/externalSubmit"
         return "https://www.mturk.com/mturk/externalSubmit"
 
@@ -504,25 +512,65 @@ class MTurkRecruiter(Recruiter):
             "reward": self.config.get("base_payment"),
             "duration_hours": self.config.get("duration"),
             "lifetime_days": self.config.get("lifetime"),
-            "ad_url": self.ad_url,
+            "question": MTurkQuestions.external(self.ad_url),
             "notification_url": self.notification_url,
-            "approve_requirement": self.config.get("approve_requirement"),
-            "us_only": self.config.get("us_only"),
-            "blacklist": self._config_to_list("qualification_blacklist"),
             "annotation": self.config.get("id"),
+            "qualifications": self._build_hit_qualifications(),
         }
         hit_info = self.mturkservice.create_hit(**hit_request)
-        if self.config.get("mode") == "sandbox":
-            lookup_url = (
-                "https://workersandbox.mturk.com/mturk/preview?groupId={type_id}"
-            )
-        else:
-            lookup_url = "https://worker.mturk.com/mturk/preview?groupId={type_id}"
+        url = hit_info["worker_url"]
 
         return {
-            "items": [lookup_url.format(**hit_info)],
+            "items": [url],
             "message": "HIT now published to Amazon Mechanical Turk",
         }
+
+    def compensate_worker(self, worker_id, email, dollars, notify=True):
+        """Pay a worker by means of a special HIT that only they can see.
+        """
+        qualification = self.mturkservice.create_qualification_type(
+            name="Dallinger Compensation Qualification - {}".format(
+                generate_random_id()
+            ),
+            description=(
+                "You have received a qualification to allow you to complete a "
+                "compensation HIT from Dallinger for ${}.".format(dollars)
+            ),
+        )
+        qid = qualification["id"]
+        self.mturkservice.assign_qualification(qid, worker_id, 1, notify=notify)
+        hit_request = {
+            "experiment_id": "(compensation only)",
+            "max_assignments": 1,
+            "title": "Dallinger Compensation HIT",
+            "description": "For compenation only; no task required.",
+            "keywords": [],
+            "reward": float(dollars),
+            "duration_hours": 1,
+            "lifetime_days": 3,
+            "question": MTurkQuestions.compensation(sandbox=self.is_sandbox),
+            "qualifications": [MTurkQualificationRequirements.must_have(qid)],
+            "do_subscribe": False,
+        }
+        hit_info = self.mturkservice.create_hit(**hit_request)
+        if email is not None:
+            message = {
+                "subject": "Dallinger Compensation HIT",
+                "sender": self.config.get("dallinger_email_address"),
+                "recipients": [email],
+                "body": (
+                    "A special compenstation HIT is available for you to complete on MTurk.\n\n"
+                    "Title: {title}\n"
+                    "Reward: ${reward:.2f}\n"
+                    "URL: {worker_url}"
+                ).format(**hit_info),
+            }
+
+            self.mailer.send(**message)
+        else:
+            message = {}
+
+        return {"hit": hit_info, "qualification": qualification, "email": message}
 
     def recruit(self, n=1):
         """Recruit n new participants to an existing HIT"""
@@ -632,22 +680,46 @@ class MTurkRecruiter(Recruiter):
 
     @property
     def is_in_progress(self):
-        # Has this recruiter resulted in any participants?
-        return bool(Participant.query.filter_by(recruiter_id=self.nickname).first())
+        """Does an MTurk HIT for the current experiment ID already exist?"""
+        experiment_id = self.config.get("id")
+        hits = self.mturkservice.get_hits(
+            hit_filter=lambda h: h["annotation"] == experiment_id
+        )
+        for _ in hits:
+            return True
+        return False
 
     @property
     def qualification_active(self):
         return bool(self.config.get("assign_qualifications"))
 
     def current_hit_id(self):
-        any_participant_record = (
-            Participant.query.with_entities(Participant.hit_id)
-            .filter_by(recruiter_id=self.nickname)
-            .first()
+        """Return the ID of the most recent HIT with our experiment ID
+        in the annotation, if any such HITs exist.
+        """
+        experiment_id = self.config.get("id")
+        hits = list(
+            self.mturkservice.get_hits(
+                hit_filter=lambda h: h["annotation"] == experiment_id
+            )
         )
+        if not hits:
+            return None
 
-        if any_participant_record is not None:
-            return str(any_participant_record.hit_id)
+        if len(hits) == 1:
+            return hits[0]["id"]
+
+        # This is unlikely, but we might have more than one HIT if one was created
+        # directly via the MTurk UI.
+        hit_ids = [h["id"] for h in sorted(hits, key=lambda k: k["created"])]
+        most_recent = hit_ids[-1]
+        logger.warn(
+            "More than one HIT found annotated with experiment ID {}: ({}). "
+            "Using {}, as it is the most recently created.".format(
+                experiment_id, ", ".join(hit_ids), most_recent
+            )
+        )
+        return most_recent
 
     def approve_hit(self, assignment_id):
         try:
@@ -672,6 +744,29 @@ class MTurkRecruiter(Recruiter):
         # except MTurkServiceException as ex:
         #     logger.exception(str(ex))
 
+    @property
+    def is_sandbox(self):
+        return self.config.get("mode") == "sandbox"
+
+    def _build_hit_qualifications(self):
+        quals = []
+        reqs = MTurkQualificationRequirements
+        if self.config.get("approve_requirement") is not None:
+            quals.append(reqs.min_approval(self.config.get("approve_requirement")))
+        if self.config.get("us_only"):
+            quals.append(reqs.restrict_to_countries(["US"]))
+        for item in self._config_to_list("mturk_qualification_blocklist"):
+            qtype = self.mturkservice.get_qualification_type_by_name(item)
+            if qtype:
+                quals.append(reqs.must_not_have(qtype["id"]))
+        if self.config.get("mturk_qualification_requirements", None) is not None:
+            explicit_qualifications = json.loads(
+                self.config.get("mturk_qualification_requirements")
+            )
+            quals.extend(explicit_qualifications)
+
+        return quals
+
     def _confirm_sns_subscription(self, token, topic):
         self.mturkservice.confirm_subscription(token=token, topic=topic)
 
@@ -692,7 +787,7 @@ class MTurkRecruiter(Recruiter):
         return status
 
     def _disable_autorecruit(self):
-        heroku_app = heroku_tools.HerokuApp(self.config.get("id"))
+        heroku_app = heroku_tools.HerokuApp(self.config.get("heroku_app_id_root"))
         args = json.dumps({"auto_recruit": "false"})
         headers = heroku_tools.request_headers(self.config.get("heroku_auth_token"))
         requests.patch(heroku_app.config_url, data=args, headers=headers)
@@ -738,7 +833,7 @@ class MTurkRecruiter(Recruiter):
 
     def _message_researcher(self, message):
         try:
-            self.messenger.send(message)
+            self.notifies_admin.send(message["subject"], message["body"])
         except MessengerError as ex:
             logger.exception(ex)
 
@@ -764,7 +859,7 @@ class MTurkLargeRecruiter(MTurkRecruiter):
     pool_size = 10
 
     def __init__(self, *args, **kwargs):
-        self.counter = kwargs.get("counter", RedisTally())
+        self.counter = kwargs.get("counter") or RedisTally()
         super(MTurkLargeRecruiter, self).__init__()
 
     def open_recruitment(self, n=1):

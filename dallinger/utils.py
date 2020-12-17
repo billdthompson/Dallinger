@@ -1,20 +1,46 @@
+from __future__ import unicode_literals
 import functools
 import io
+import locale
 import os
 import random
+import redis
 import shutil
 import string
 import subprocess
 import sys
 import tempfile
+import webbrowser
 from pkg_resources import get_distribution
+from six.moves.urllib.parse import urlparse
 
 from dallinger.config import get_config
+from dallinger.compat import is_command
+
+
+def connect_to_redis(url=None):
+    """Return a connection to Redis.
+
+    If a URL is supplied, it will be used, otherwise an environment variable
+    is checked before falling back to a default.
+
+    Since we are generally running on Heroku, and configuring SSL certificates
+    is challenging, we disable cert requirements on secure connections.
+    """
+    redis_url = url or os.getenv("REDIS_URL", "redis://localhost:6379")
+    connection_args = {"url": redis_url}
+    if urlparse(redis_url).scheme == "rediss":
+        connection_args["ssl_cert_reqs"] = None
+
+    return redis.from_url(**connection_args)
 
 
 def get_base_url():
     config = get_config()
     host = os.getenv("HOST", config.get("host"))
+    if host == "0.0.0.0":
+        host = "localhost"
+
     if "herokuapp.com" in host:
         if host.startswith("https://"):
             base_url = host
@@ -124,6 +150,16 @@ class GitClient(object):
         self._run(cmd)
         return tempdir
 
+    def files(self):
+        cmd = ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+        try:
+            raw = check_output(cmd).decode(locale.getpreferredencoding())
+        except Exception:
+            return set()
+
+        result = {item for item in raw.split("\0") if item}
+        return result
+
     def _run(self, cmd):
         self._log(cmd)
         try:
@@ -214,3 +250,82 @@ def wrap_subprocess_call(func, wrap_stdout=True):
 check_call = wrap_subprocess_call(subprocess.check_call)
 call = wrap_subprocess_call(subprocess.call)
 check_output = wrap_subprocess_call(subprocess.check_output, wrap_stdout=False)
+
+
+def open_browser(url):
+    """Open a browser with a fresh profile"""
+    _new_webbrowser_profile().open(url, new=1, autoraise=True)
+
+
+def _make_chrome(path):
+    new_chrome = webbrowser.Chrome()
+    new_chrome.name = path
+    profile_directory = tempfile.mkdtemp()
+    with open(os.path.join(profile_directory, "First Run"), "wb") as firstrun:
+        # This file existing prevents prompts to make the new profile directory
+        # the default
+        firstrun.flush()
+    new_chrome.remote_args = webbrowser.Chrome.remote_args + [
+        '--user-data-dir="{}"'.format(profile_directory),
+        "--no-first-run",
+    ]
+    return new_chrome
+
+
+def _new_webbrowser_profile():
+    if is_command("google-chrome"):
+        return _make_chrome("google-chrome")
+    elif is_command("firefox"):
+        new_firefox = webbrowser.Mozilla()
+        new_firefox.name = "firefox"
+        profile_directory = tempfile.mkdtemp()
+        new_firefox.remote_args = [
+            "-profile",
+            profile_directory,
+            "-new-instance",
+            "-no-remote",
+            "-url",
+            "%s",
+        ]
+        return new_firefox
+    elif sys.platform == "darwin":
+        config = get_config()
+        chrome_path = config.get("chrome-path")
+        if os.path.exists(chrome_path):
+            return _make_chrome(chrome_path)
+        else:
+            return webbrowser
+    else:
+        return webbrowser
+
+
+def struct_to_html(data):
+    parts = ["<ul>"]
+    if isinstance(data, (list, tuple)):
+        for i in data:
+            parts.append(struct_to_html(i))
+    elif isinstance(data, dict):
+        if len(data) == 2 and "count" in data and "failed" in data:
+            if data["count"]:
+                failed_percentage = float(data["failed"]) / data["count"] * 100
+            else:
+                failed_percentage = 0
+            value = "{} total, {} failed ({:.1f}%)".format(
+                data["count"], data["failed"], failed_percentage
+            )
+            if failed_percentage == 100:
+                value = '<span class="all-failures">{}</span>'.format(value)
+            elif failed_percentage > 0:
+                value = '<span class="some-failures">{}</span>'.format(value)
+            elif data["count"]:
+                value = '<span class="no-failures">{}</span>'.format(value)
+            return value
+
+        for k in data:
+            item = struct_to_html(data[k])
+            parts.append("<li>{}: {}</li>".format(k, item))
+    else:
+        return str(data)
+
+    parts.append("</ul>")
+    return "\n".join(parts)

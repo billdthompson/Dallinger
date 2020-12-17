@@ -59,7 +59,19 @@ class SharedMixin(object):
     #: a generic column for storing structured JSON data
     details = Column(JSONB, nullable=False, server_default="{}", default=lambda: {})
 
+    #: HTML string to display in visualizations (e.g. the Network
+    #: Montioring Dashboard). You can override this with a dynamic ``@property``
+    #: on sub-classes.
+    visualization_html = ""
+
     def json_data(self):
+        """Returns a JSON serializable ``dict`` (``datetime`` values allowed)
+        to describe this object. This method can be overridden by sub-classes
+        to extend the default model data used for display in the Dashboard
+        Network Monitor and Database views.
+
+        :returns: ``dict`` with JSON serializable data
+        """
         return {}
 
     def __json__(self):
@@ -189,6 +201,7 @@ class Participant(Base, SharedMixin):
             "base_pay": self.base_pay,
             "bonus": self.bonus,
             "status": self.status,
+            "object_type": "Participant",
         }
 
     def nodes(self, type=None, failed=False):
@@ -297,10 +310,10 @@ class Question(Base, SharedMixin):
     number = Column(Integer, nullable=False)
 
     #: the text of the question
-    question = Column(String(250), nullable=False)
+    question = Column(Text, nullable=False)
 
     #: the participant's response. Stored as a string.
-    response = Column(String(1000), nullable=False)
+    response = Column(Text, nullable=False)
 
     def __init__(self, participant, question, response, number):
         """Create a question."""
@@ -337,6 +350,7 @@ class Question(Base, SharedMixin):
             "participant_id": self.participant_id,
             "question": self.question,
             "response": self.response,
+            "object_type": "Question",
         }
 
 
@@ -384,6 +398,7 @@ class Network(Base, SharedMixin):
             "max_size": self.max_size,
             "full": self.full,
             "role": self.role,
+            "object_type": "Network",
         }
 
     """ ###################################
@@ -635,6 +650,7 @@ class Node(Base, SharedMixin):
             "type": self.type,
             "network_id": self.network_id,
             "participant_id": self.participant_id,
+            "object_type": "Node",
         }
 
     """ ###################################
@@ -1384,6 +1400,7 @@ class Vector(Base, SharedMixin):
             "origin_id": self.origin_id,
             "destination_id": self.destination_id,
             "network_id": self.network_id,
+            "object_type": "Vector",
         }
 
     """#######################################
@@ -1449,11 +1466,13 @@ class Info(Base, SharedMixin):
     #: the contents of the info. Must be stored as a String.
     contents = Column(Text(), default=None)
 
-    def __init__(self, origin, contents=None, details=None):
+    def __init__(self, origin, contents=None, details=None, failed=False):
         """Create an info."""
         # check the origin hasn't failed
-        if origin.failed:
-            raise ValueError("{} cannot create an info as it has failed".format(origin))
+        if origin.failed and not failed:
+            raise ValueError(
+                "Only failed Infos can be added to {}, as it has failed".format(origin)
+            )
 
         self.origin = origin
         self.origin_id = origin.id
@@ -1462,6 +1481,8 @@ class Info(Base, SharedMixin):
         self.network = origin.network
         if details:
             self.details = details
+        if failed is not None:
+            self.failed = failed
 
     @validates("contents")
     def _write_once(self, key, value):
@@ -1481,6 +1502,7 @@ class Info(Base, SharedMixin):
             "origin_id": self.origin_id,
             "network_id": self.network_id,
             "contents": self.contents,
+            "object_type": "Info",
         }
 
     def fail(self):
@@ -1670,6 +1692,7 @@ class Transmission(Base, SharedMixin):
             "network_id": self.network_id,
             "receive_time": self.receive_time,
             "status": self.status,
+            "object_type": "Transmission",
         }
 
     def fail(self):
@@ -1760,6 +1783,7 @@ class Transformation(Base, SharedMixin):
             "info_out_id": self.info_out_id,
             "node_id": self.node_id,
             "network_id": self.network_id,
+            "object_type": "Transformation",
         }
 
     def fail(self):

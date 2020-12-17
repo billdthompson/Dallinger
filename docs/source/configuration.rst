@@ -23,6 +23,11 @@ first among environment variables, then in a ``config.txt`` in the experiment
 directory, and then in the ``.dallingerconfig`` file, using whichever value
 is found first. If the parameter is not found, Dallinger will use the default.
 
+If a value is extracted from the environment or a config file it will be converted
+to the correct type. You can also specify a value of ``file:/path/to/file`` to
+use the contents of that file on your local computer.
+
+
 Built-in configuration
 ----------------------
 
@@ -40,12 +45,26 @@ General
 
 ``loglevel`` *unicode*
     A number between 0 and 4 that controls the verbosity of logs, from ``debug``
-    to ``critical``.
+    to ``critical``. Note that ``dallinger debug`` ignores this setting and always
+    runs at 0 (``debug``).
 
 ``whimsical`` *boolean*
     What's life without whimsy? Controls whether email notifications sent
     regarding various experiment errors are whimsical in tone, or more
     matter-of-fact.
+
+``dashboard_password`` *unicode*
+    An optional password for accessing the Dallinger Dashboard interface. If not
+    specified, a random password will be generated.
+
+``dashboard_user`` *unicode*
+    An optional login name for accessing the Dallinger Dashboard interface. If not
+    specified ``admin`` will be used.
+
+``enable_global_experiment_registry`` *boolean*
+    Enable a global experiment id registration. When enabled, the ``collect`` API
+    check this registry to see if an experiment has already been run and reject
+    re-running an experiment if it has been.
 
 
 Recruitment (General)
@@ -105,9 +124,12 @@ Amazon Mechanical Turk Recruitment
 ``group_name`` *unicode*
     Assign a named qualification to workers who complete a HIT.
 
-``qualification_blacklist`` *unicode - comma seperated*
+``mturk_qualification_blocklist`` *unicode - comma seperated*
     Comma-separated list of qualification names. Workers with qualifications in
     this list will be prevented from viewing and accepting the HIT.
+
+``mturk_qualification_requirements`` *unicode - JSON formatted*
+    A JSON list of qualification documents to pass to Amazon Mechanical Turk.
 
 ``title`` *unicode*
     The title of the HIT on Amazon Mechanical Turk.
@@ -205,6 +227,14 @@ Deployment Configuration
     If the clock process is on, it will perform a series of checks that ensure
     the integrity of the database.
 
+``heroku_python_version`` *unicode*
+    The python version to be used on Heroku deployments. The version specification will
+    be deployed to Heroku in a `runtime.txt` file in accordance with Heroku's deployment
+    API. Note that only the version number should be provided (eg: "2.7.14") and not the
+    "python-" prefix included in the final `runtime.txt` format.
+    See Dallinger's `global_config_defaults.txt` for the current default version.
+    See `Heroku supported runtimes <https://devcenter.heroku.com/articles/python-support#supported-runtimes>`__.
+
 ``heroku_team`` *unicode*
     The name of the Heroku team to which all applications will be assigned.
     This is useful for centralized billing. Note, however, that it will prevent
@@ -248,14 +278,25 @@ very large difference to how the application behaves.
     more performant on underloaded dynos, so a better heuristic is ``0.25*number_of_bots``.
 
 ``dyno_type``
-    This determines how powerful the heroku dyno that's started is. It applies to both
-    web and worker dyno types. The minimum recommended is ``standard-1x``, which should be
-    sufficient for experiments that do not rely on real-time coordination, such as
-    :doc:`demos/bartlett1932/index`.
-    Experiments that require significant power to process websocket events should consider
-    the higher levels, ``standard-2x``, ``performance-m`` and ``performance-l``. In all but
-    the most intensive experiments, either ``dyno_type`` or ``num_dynos_web`` should be
-    increased, not both.
+    This determines how powerful the heroku dynos started by Dallinger are. It is applied
+    as the default for both web and worker dyno types. The minimum recommended is
+    ``standard-1x``, which should be sufficient for experiments that do not rely on
+    real-time coordination, such as :doc:`demos/bartlett1932/index`. Experiments that
+    require significant power to process websocket events should consider the higher
+    levels, ``standard-2x``, ``performance-m`` and ``performance-l``. In all but the
+    most intensive experiments, either ``dyno_type`` or ``num_dynos_web`` should be
+    increased, not both. See ``dyno_type_web`` and ``dyno_type_worker`` below
+    for information about more specific settings.
+
+``dyno_type_web``
+    This determines how powerful the heroku web dynos are. It applies only to web dynos
+    and will override the default set in ``dyno_type``. See ``dyno_type`` above for details
+    on specific values.
+
+``dyno_type_worker``
+    This determines how powerful the heroku worker dynos are. It applies only to worker
+    dynos and will override the default set in ``dyno_type``.. See ``dyno_type`` above for
+    details on specific values.
 
 ``redis_size``
     A larger value for this increases the number of connections available on the redis dyno.

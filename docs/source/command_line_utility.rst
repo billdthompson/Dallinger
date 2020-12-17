@@ -8,7 +8,15 @@ Dallinger is executed from the command line within the experiment directory with
 verify
 ^^^^^^
 
-Verify that a directory is a Dallinger-compatible app.
+Verify that a directory is a Dallinger-compatible app. A number of checks are run here:
+
+    * Required files are verified to exist
+    * The cumulative size of all experiment files is checked to make sure large files or
+      directories are not accidentally included (note that files excluded with a .gitignore
+      file are **not** included in this size total)
+    * The experiment.py file is checked to make sure it includes a single Experiment subclass
+    * The configuration for ``base_payment`` from config.txt is validated
+    * Included files are checked for name conflicts with core Dallinger files
 
 .. _dallinger-bot:
 
@@ -30,10 +38,13 @@ specify an alternative port when opening browser windows.
 sandbox
 ^^^^^^^
 
-Runs the experiment on MTurk's sandbox using Heroku as a server. An optional
-``--verbose`` flag prints more detailed logs to the command line. An optional
-``--app <app>`` parameter specifies the experiment id, if not specified, a new
+Runs the experiment on MTurk's sandbox using Heroku as a server.
+An optional ``--verbose`` flag prints more detailed logs to the command line.
+An optional ``--app <app>`` parameter specifies the experiment id. If not specified, a new
 unique experiment experiment id is automatically generated.
+An optional ``--archive <relative file path>`` parameter specifies an experiment archive
+(previously created with ``dallinger export``) from which to pre-populate the database
+before starting recruitment.
 
 deploy
 ^^^^^^
@@ -43,6 +54,9 @@ Runs the experiment live on MTurk using Heroku as a server. An optional
 ``--bot`` flag forces the bot recruiter to be used, rather than the configured
 recruiter. An optional ``--app <app>`` parameter specifies the experiment id,
 if not specified, a new unique experiment id is automatically generated.
+An optional ``--archive <relative file path>`` parameter specifies an experiment archive
+(previously created with ``dallinger export``) from which to pre-populate the database
+before starting recruitment.
 
 logs
 ^^^^
@@ -66,6 +80,41 @@ id. Use the optional ``--local`` flag if exporting a local experiment data.
 An optional ``--no-scrub`` flag will stop the scrubbing of personally
 identifiable information in the export. The scrubbing of PII is enabled by
 default.
+
+email_test
+~~~~~~~~~~
+
+Validate email settings derived from Dallinger Configuration and send a test
+email if the configuration appears valid.
+
+The test email will use ``dallinger_email_address`` as the sender and
+``contact_email_on_error`` as the recipient.
+
+
+compensate
+~~~~~~~~~~
+
+Compensate a worker a specific amount in US dollars. This is useful if something
+goes wrong with the experiment and you need to pay workers for their wasted
+time. Currently only the ``mturk`` recruiter is supported, and is the default,
+so doesn't need to be specified.
+
+For Mechanical Turk, compensation is acheived by:
+    1. Creating a unique qualification and assigning it to the worker
+    2. Creating a very simple HIT which is only visible to workers with this
+       qualification, using the dollar amount specified in the command as the
+       base payment
+    3. Automatically approving (and thus granting base payment) when the HIT
+       is submitted.
+
+Usage:
+    * ``--worker_id`` (required) - The worker's identifier
+    * ``--dollars`` (required) - The amount to pay, in US dollars
+    * ``--sandbox`` (optional flag) - If present, the compensation will be made
+      via the test platform (the MTurk Sandbox)
+    * ``--email`` (optional) - An email address, which if present, will be
+      used to notify the worker that they've been compensated
+
 
 qualify
 ^^^^^^^
@@ -129,6 +178,18 @@ expire
 Expire all MTurk HITs for a dallinger app. A required ``--app <app>``
 parameter specifies the experiment by its id. An optional ``--sandbox``
 flag indicates to look for HITs in the MTurk sandbox.
+
+extend_mturk_hit
+^^^^^^^^^^^^^^^^
+
+Extend an MTurk HIT by a some number of assignments, and optionally, an
+additional number of hours.
+A required ``--hit_id`` parameter should contain
+the MTurk HIT Id, ``--assignments`` should contain the additional number of
+HIT assigments to create. To extend the duration of the HIT, also include
+a ``duration_hours`` parameter, which may be a decimal (``--duration_hours 2.5``
+is acceptable input.) If your HIT is in the MTurk sandbox, you must add a
+``--sandbox`` flag.
 
 apps
 ^^^^

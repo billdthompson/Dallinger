@@ -3,6 +3,7 @@
 import json
 import logging
 import random
+import tempfile
 import uuid
 
 from cached_property import cached_property
@@ -89,7 +90,14 @@ class BotBase(object):
         else:
             driver_class = DRIVER_MAP.get(driver_type.lower())
             if driver_class is not None:
-                driver = driver_class()
+                kwargs = {}
+                # Phantom JS needs a new local storage directory for every run
+                if driver_class is webdriver.PhantomJS:
+                    tmpdirname = tempfile.mkdtemp()
+                    kwargs = {
+                        "service_args": ["--local-storage-path={}".format(tmpdirname)],
+                    }
+                driver = driver_class(**kwargs)
 
         if driver is None:
             raise ValueError("Unsupported webdriver_type: {}".format(driver_type))
@@ -113,7 +121,7 @@ class BotBase(object):
             begin.click()
             logger.info("Clicked begin experiment button.")
             WebDriverWait(self.driver, 10).until(lambda d: len(d.window_handles) == 2)
-            self.driver.switch_to_window(self.driver.window_handles[-1])
+            self.driver.switch_to.window(self.driver.window_handles[-1])
             self.driver.set_window_size(1024, 768)
             logger.info("Switched to experiment popup.")
             consent = WebDriverWait(self.driver, 10).until(
@@ -164,7 +172,7 @@ class BotBase(object):
             self.complete_questionnaire()
             feedback.click()
             logger.info("Clicked submit questionnaire button.")
-            self.driver.switch_to_window(self.driver.window_handles[0])
+            self.driver.switch_to.window(self.driver.window_handles[0])
             self.driver.set_window_size(1024, 768)
             logger.info("Switched back to initial window.")
             return True

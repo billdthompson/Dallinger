@@ -15,10 +15,12 @@ dallinger_email_address = dallinger@mailinator.com
 [Experiment]
 replay = False
 mode = debug
+enable_global_experiment_registry = False
 
 [Recruiter]
 auto_recruit = False
 assign_qualifications = False
+us_only = False
 
 [Bots]
 webdriver_type = phantomjs
@@ -26,6 +28,7 @@ chrome-path = /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 
 [Heroku]
 clock_on = False
+heroku_python_version = 3.6.10
 sentry = False
 redis_size = premium-0
 worker_multiplier = 1.5

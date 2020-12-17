@@ -428,6 +428,38 @@ var dallinger = (function () {
   };
 
   /**
+   * Load an existing `Participant` into the dlgr.identity by making a ``POST``
+   * request to the experiment `/participant` route with an ``assignment_id``.
+   *
+   * @returns {jQuery.Deferred} See :ref:`deferreds-label`
+   */
+  dlgr.loadParticipant = function(assignment_id) {
+    var deferred = $.Deferred(),
+        url = '/participant';
+
+    if (dlgr.identity.participantId !== undefined && dlgr.identity.participantId !== 'undefined') {
+      deferred.resolve();
+    } else {
+      $(function () {
+        $('.btn-success').prop('disabled', true);
+        dlgr.post(url, {assignment_id: assignment_id}).done(function (resp) {
+          console.log(resp);
+          $('.btn-success').prop('disabled', false);
+          dlgr.identity.participantId = resp.participant.id;
+          dlgr.identity.recruiter = resp.participant.recruiter_id;
+          dlgr.identity.hitId = resp.participant.hit_id;
+          dlgr.identity.workerId = resp.participant.worker_id;
+          dlgr.identity.assignmentId = assignment_id;
+          dlgr.identity.mode = resp.participant.mode;
+          dlgr.identity.fingerprintHash = resp.participant.fingerprint_hash;
+          deferred.resolve();
+        });
+      });
+    }
+    return deferred;
+  };
+
+  /**
    * Creates a new experiment `Node` for the current partcipant.
    *
    * @example
@@ -541,13 +573,13 @@ var dallinger = (function () {
    * @param {string} [name=questionnaire] - optional questionnaire name
    */
   dlgr.submitQuestionnaire = function (name) {
-    var formSerialized = $("form").serializeArray(),
-      spinner = dlgr.BusyForm(),
-      formDict = {},
-      xhr;
-
-    formSerialized.forEach(function (field) {
-      formDict[field.name] = field.value;
+    var inputs = $("form :input");
+    var spinner = dlgr.BusyForm();
+    var formDict = {};
+    $.each(inputs, function(key, input) {
+      if (input.name !== "") {
+        formDict[input.name] = $(input).val();
+      }
     });
 
     xhr = dlgr.post('/question/' + dlgr.identity.participantId, {
@@ -635,4 +667,9 @@ var dallinger = (function () {
   return dlgr;
 }());
 
-module.exports.dallinger = dallinger;
+
+try {
+  module.exports.dallinger = dallinger;
+} catch (err) {
+  // We aren't being loaded from a node context, no need to export
+}

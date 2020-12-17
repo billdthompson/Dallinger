@@ -13,8 +13,7 @@ from dallinger.config import Configuration
 from dallinger.config import get_config, LOCAL_CONFIG
 
 
-@pytest.mark.usefixtures("experiment_dir")
-class TestConfiguration(object):
+class TestConfigurationUnitTests(object):
     def test_register_new_variable(self):
         config = Configuration()
         config.register("num_participants", int)
@@ -58,6 +57,16 @@ class TestConfiguration(object):
         with pytest.raises(TypeError):
             config.extend({"num_participants": "A NUMBER"}, cast_types=True)
 
+    def test_type_casts_follow_file_pointers(self):
+        config = Configuration()
+        config.register("data", six.text_type)
+        config.ready = True
+        with NamedTemporaryFile() as data_file:
+            data_file.write("hello".encode("utf-8"))
+            data_file.flush()
+            config.extend({"data": "file:" + data_file.name}, cast_types=True)
+        assert config.get("data") == "hello"
+
     def test_get_before_ready_is_not_possible(self):
         config = Configuration()
         config.register("num_participants", int)
@@ -79,6 +88,19 @@ class TestConfiguration(object):
         config.ready = True
         config.extend({"num_participants": 1})
         config.get("num_participants", None)
+
+    def test_setting_value_that_doesnt_validate_fails(self):
+        config = Configuration()
+
+        def is_purple(val):
+            if val != "purple":
+                raise ValueError
+
+        config.register("fave_colour", six.text_type, validators=[is_purple])
+        config.ready = True
+        config.set("fave_colour", "purple")
+        with pytest.raises(ValueError):
+            config.set("fave_colour", "red")
 
     def test_setting_by_set(self):
         config = Configuration()
@@ -181,6 +203,9 @@ worldwide = false
         config.ready = True
         assert config.get("num_participants") == 1
 
+
+@pytest.mark.usefixtures("experiment_dir_merged")
+class TestConfigurationIntegrationTests(object):
     @pytest.mark.slow
     def test_experiment_defined_parameters(self):
         try:
@@ -208,44 +233,15 @@ worldwide = false
         config.register_extra_parameters()
         config.load_from_file(LOCAL_CONFIG)
 
-    def test_custom_experiment_module_set_and_retained(self):
+    def test_custom_experiment_module_set_and_retained(self, reset_config):
         config = get_config()
-        with mock.patch.dict("sys.modules", dallinger_experiment=None):
-            config.register_extra_parameters()
-            assert sys.modules["dallinger_experiment"] is not None
+        config.register_extra_parameters()
+        assert sys.modules["dallinger_experiment"] is not None
         exp_module = mock.Mock()
         with mock.patch.dict("sys.modules", dallinger_experiment=exp_module):
             config.clear()
             config.register_extra_parameters()
             assert sys.modules["dallinger_experiment"] is exp_module
-
-    def test_local_base_url(self):
-        from dallinger.utils import get_base_url
-
-        config = get_config()
-        config.ready = True
-        config.set("host", "localhost")
-        config.set("base_port", 5000)
-        config.set("num_dynos_web", 1)
-        assert get_base_url() == "http://localhost:5000"
-
-    def test_remote_base_url(self):
-        from dallinger.utils import get_base_url
-
-        config = get_config()
-        config.ready = True
-        config.set("host", "https://dlgr-bogus.herokuapp.com")
-        config.set("num_dynos_web", 1)
-        assert get_base_url() == "https://dlgr-bogus.herokuapp.com"
-
-    def test_remote_base_url_always_ssl(self):
-        from dallinger.utils import get_base_url
-
-        config = get_config()
-        config.ready = True
-        config.set("host", "http://dlgr-bogus.herokuapp.com")
-        config.set("num_dynos_web", 1)
-        assert get_base_url() == "https://dlgr-bogus.herokuapp.com"
 
     def test_write_omits_sensitive_keys_if_filter_sensitive(self, in_tempdir):
         config = get_config()

@@ -3,6 +3,9 @@ import mock
 import pytest
 from datetime import datetime
 from dallinger import models
+from dallinger.config import get_config
+
+config = get_config()
 
 
 @pytest.mark.usefixtures("experiment_dir")
@@ -10,11 +13,12 @@ from dallinger import models
 class TestAppConfiguration(object):
     def test_config_gets_loaded_before_first_request(self, webapp, active_config):
         active_config.clear()
+        active_config.ready = False
         webapp.get("/")
         active_config.load.assert_called_once()
         assert active_config.ready
 
-    def test_debug_mode_puts_flask_in_debug_mode(self, webapp, active_config):
+    def test_debug_mode_puts_flask_in_debug_mode(self, webapp):
         webapp.application.debug = False
         from dallinger.experiment_server.gunicorn import StandaloneServer
 
@@ -32,6 +36,38 @@ class TestAppConfiguration(object):
         with mock.patch("sys.argv", ["gunicorn"]):
             StandaloneServer().load()
         assert not webapp.application.debug
+
+    def test_debug_mode_no_proxyfix(self, webapp, active_config):
+        active_config.extend({"mode": u"debug"})
+        from dallinger.experiment_server.gunicorn import StandaloneServer
+
+        with mock.patch("sys.argv", ["gunicorn"]):
+            with mock.patch(
+                "dallinger.experiment_server.gunicorn.ProxyFix"
+            ) as ProxyFix:
+                StandaloneServer().load()
+                ProxyFix.assert_not_called()
+
+    def test_production_mode_load_wraps_proxyfix(self, webapp, active_config):
+        active_config.extend({"mode": u"production"})
+        from dallinger.experiment_server.gunicorn import StandaloneServer
+
+        with mock.patch("sys.argv", ["gunicorn"]):
+            with mock.patch(
+                "dallinger.experiment_server.gunicorn.ProxyFix"
+            ) as ProxyFix:
+                StandaloneServer().load()
+                ProxyFix.called_once_with(webapp.application)
+
+    def test_load_sets_flask_secret_from_env(self, webapp, active_config, env):
+        webapp.application.debug = False
+        from dallinger.experiment_server.gunicorn import StandaloneServer
+
+        env["FLASK_SECRET_KEY"] = "A BAD SECRET KEY"
+        with mock.patch("sys.argv", ["gunicorn"]):
+            StandaloneServer().load()
+        assert webapp.application.secret_key == "A BAD SECRET KEY"
+        assert webapp.application.config["SECRET_KEY"] == "A BAD SECRET KEY"
 
     def test_gunicorn_worker_config(self, webapp, active_config):
         with mock.patch("multiprocessing.cpu_count") as cpu_count:
@@ -51,6 +87,11 @@ class TestAppConfiguration(object):
                 active_config.extend({"threads": u"2"})
                 server.load_user_config()
                 assert server.options["workers"] == u"2"
+
+    def test_flask_secret_loaded_from_environ(self, webapp):
+        with mock.patch("os.environ", {"FLASK_SECRET_KEY": "A TEST SECRET KEY"}):
+            webapp.get("/")
+            assert webapp.application.config["SECRET_KEY"] == "A TEST SECRET KEY"
 
 
 @pytest.mark.usefixtures("experiment_dir")
@@ -247,6 +288,31 @@ class TestQuestion(object):
         )
         assert models.Question.query.all()
 
+    def test_excessive_question_text_is_blocked(self, a, webapp, active_config):
+        # The normal max length is 1000
+        resp = webapp.post(
+            "/question/{}?question=q&response={}&number=1".format(
+                a.participant().id, "x" * 1001
+            )
+        )
+        assert resp.status_code == 400
+
+        resp = webapp.post(
+            "/question/{}?question=q&response={}&number=1".format(
+                a.participant().id, "x" * 1000
+            )
+        )
+        assert resp.status_code == 200
+
+        # Override the length to go shorter
+        with active_config.override({"question_max_length": 99}):
+            resp = webapp.post(
+                "/question/{}?question=q&response={}&number=1".format(
+                    a.participant().id, "x" * 100
+                )
+            )
+        assert resp.status_code == 400
+
     def test_nonworking_mturk_participants_accepted_if_debug(
         self, a, webapp, active_config
     ):
@@ -365,11 +431,11 @@ class TestWorkerComplete(object):
 
 @pytest.fixture
 def mock_messenger():
-    from dallinger.notifications import EmailingMessenger
+    from dallinger.notifications import NotifiesAdmin
 
-    messenger = mock.Mock(spec=EmailingMessenger)
+    messenger = mock.Mock(spec=NotifiesAdmin)
     with mock.patch(
-        "dallinger.experiment_server.experiment_server.get_messenger"
+        "dallinger.experiment_server.experiment_server.admin_notifier"
     ) as get:
         get.return_value = messenger
         yield messenger
@@ -550,7 +616,6 @@ class TestSimpleGETRoutes(object):
         resp = webapp.get("/")
         assert resp.status_code == 200
         assert b"Dallinger Experiment in progress" in resp.data
-        assert b">id<" in resp.data
 
     def test_favicon(self, webapp):
         resp = webapp.get("/favicon.ico")
@@ -638,18 +703,65 @@ class TestParticipantGetRoute(object):
 
 @pytest.mark.usefixtures("experiment_dir", "db_session")
 @pytest.mark.slow
+class TestParticipantByAssignmentRoute(object):
+    def test_load_participant_calls_experiment_method(self, a, webapp):
+        p = a.participant()
+        with mock.patch(
+            "dallinger.experiment.Experiment.load_participant"
+        ) as load_participant:
+            load_participant.side_effect = lambda *args: p
+            webapp.post("/participant", data={"assignment_id": p.assignment_id})
+            load_participant.assert_called_once_with(p.assignment_id)
+
+    def test_load_participant(self, a, webapp):
+        p = a.participant()
+        resp = webapp.post("/participant", data={"assignment_id": p.assignment_id})
+        data = json.loads(resp.data.decode("utf8"))
+        assert data.get("status") == "success"
+        assert data.get("participant").get("status") == u"working"
+
+    def test_missing_assignment(self, webapp):
+        resp = webapp.post("/participant")
+        data = json.loads(resp.data.decode("utf8"))
+        assert data.get("status") == "error"
+        assert "no participant found" in data.get("html")
+
+    def test_assignment_invalid(self, webapp):
+        nonexistent_assignment_id = "asfkhaskjfhhjlkasf"
+        resp = webapp.post(
+            "/participant", data={"assignment_id": nonexistent_assignment_id}
+        )
+        data = json.loads(resp.data.decode("utf8"))
+        assert data.get("status") == "error"
+        assert "no participant found" in data.get("html")
+
+
+@pytest.mark.usefixtures("experiment_dir", "db_session")
+@pytest.mark.slow
 class TestParticipantCreateRoute(object):
     @pytest.fixture
-    def overrecruited(self):
+    def overrecruited(self, a):
         with mock.patch(
             "dallinger.experiment_server.experiment_server.Experiment"
         ) as mock_class:
             mock_exp = mock.Mock(name="the experiment")
             mock_exp.is_overrecruited.return_value = True
             mock_exp.quorum = 50
+            mock_exp.create_participant.return_value = a.participant()
             mock_class.return_value = mock_exp
 
             yield mock_class
+
+    def test_create_participant_calls_experiment_method(self, a, webapp):
+        p = a.participant()
+        with mock.patch(
+            "dallinger.experiment.Experiment.create_participant"
+        ) as create_participant:
+            create_participant.side_effect = lambda *args: p
+            webapp.post("/participant/1/1/1/debug")
+            create_participant.assert_called_once_with(
+                "1", "1", "1", "debug", None, None
+            )
 
     def test_creates_participant_if_worker_id_unique(self, webapp):
         worker_id = "1"
@@ -1059,6 +1171,36 @@ class TestInfoRoutePOST(object):
         resp = webapp.post("/info/{}".format(node.id), data=data)
         data = json.loads(resp.data.decode("utf8"))
         assert u"info" in data
+
+    def test_info_defaults_to_unfailed(self, a, webapp):
+        node = a.node()
+        data = {"contents": "foo"}
+        resp = webapp.post("/info/{}".format(node.id), data=data)
+        data = json.loads(resp.data.decode("utf8"))
+        assert data["info"]["failed"] is False
+
+    def test_info_can_be_failed(self, a, webapp):
+        node = a.node()
+        data = {"contents": "foo", "failed": "True"}
+        resp = webapp.post("/info/{}".format(node.id), data=data)
+        data = json.loads(resp.data.decode("utf8"))
+        assert data["info"]["failed"] is True
+
+    def test_failed_info_can_attach_to_failed_node(self, db_session, a, webapp):
+        node = a.node()
+        node.fail()
+        # All the tests like this should have commits. This one needs an explicit
+        # one as the first request triggers a rollback rather than a commit.
+        db_session.commit()
+
+        data = {"contents": "foo"}
+        resp = webapp.post("/info/{}".format(node.id), data=data)
+        assert resp.status_code == 403
+
+        data = {"contents": "foo", "failed": "True"}
+        resp = webapp.post("/info/{}".format(node.id), data=data)
+        data = json.loads(resp.data.decode("utf8"))
+        assert data["info"]["failed"] is True
 
     def test_loads_details_json_value(self, a, webapp):
         node = a.node()

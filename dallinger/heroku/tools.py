@@ -155,6 +155,10 @@ class HerokuApp(HerokuCommandRunner):
         return "https://dashboard.heroku.com/apps/{}".format(self.name)
 
     @property
+    def dashboard_metrics_url(self):
+        return "{}/metrics".format(self.dashboard_url)
+
+    @property
     def db_uri(self):
         """The connection URL for the remote database. For example:
         postgres://some-long-uid@ec2-52-7-232-59.compute-1.amazonaws.com:5432/d5fou154it1nvt
@@ -304,6 +308,20 @@ class HerokuApp(HerokuCommandRunner):
     def _is_sensitive_key(self, key):
         return any([s in key for s in SENSITIVE_KEY_NAMES])
 
+    def addon_parameters(self):
+        addon_listing = self._result(["heroku", "addons", "--app", self.name])
+        addon_types = re.findall("as ([A-Z]+)", addon_listing)
+        addon_info = {}
+        for addon_type in addon_types:
+            url = self._result(
+                ["heroku", "addons:open", "--app", self.name, addon_type, "--show-url"]
+            ).strip()
+            addon_info[addon_type] = {
+                "url": url,
+                "title": addon_type.title(),
+            }
+        return addon_info
+
 
 def app_name(id):
     """Convert a UUID to a valid Heroku app name."""
@@ -385,7 +403,7 @@ class HerokuLocalWrapper(object):
 
         def _handle_timeout(signum, frame):
             raise HerokuTimeoutError(
-                "Failed to start after {} seconds.".format(timeout_secs, self._record)
+                "Failed to start after {} seconds.".format(timeout_secs)
             )
 
         if self.is_running:
@@ -460,7 +478,7 @@ class HerokuLocalWrapper(object):
                         "There was an error while starting the server. "
                         "Run with --verbose for details."
                     )
-                    self.out.error("Sign of error found in line: ".format(line))
+                    self.out.error("Sign of error found in line: {}".format(line))
                 return False
 
         return False
@@ -539,9 +557,13 @@ class HerokuLocalWrapper(object):
 
 def sanity_check(config):
     # check if dyno size is compatible with team configuration.
-    size = config.get("dyno_type")
+    sizes = {
+        config.get("dyno_type"),
+        config.get("dyno_type_web", None),
+        config.get("dyno_type_worker", None),
+    }
     team = config.get("heroku_team", None)
-    if team and size == "free":
+    if team and "free" in sizes:
         raise RuntimeError(
             'Heroku "free" dyno type not compatible '
             "with team/org deployment. Please use a "

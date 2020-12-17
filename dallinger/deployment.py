@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+import codecs
+import json
 import os
 import pkg_resources
 import re
@@ -5,69 +9,33 @@ import redis
 import requests
 import shutil
 import six
-import sys
 import tempfile
 import threading
 import time
-import webbrowser
+
 from six.moves import shlex_quote as quote
+from six.moves.urllib.parse import urlparse
+from six.moves.urllib.parse import urlunparse
+from unicodedata import normalize
 
 from dallinger import data
 from dallinger import db
 from dallinger import heroku
 from dallinger import recruiters
 from dallinger import registration
-from dallinger.compat import is_command
 from dallinger.config import get_config
 from dallinger.heroku.tools import HerokuApp
 from dallinger.heroku.tools import HerokuLocalWrapper
+from dallinger.utils import connect_to_redis
 from dallinger.utils import dallinger_package_path
 from dallinger.utils import ensure_directory
 from dallinger.utils import get_base_url
+from dallinger.utils import open_browser
 from dallinger.utils import GitClient
-
-config = get_config()
-
-
-def _make_chrome(path):
-    new_chrome = webbrowser.Chrome()
-    new_chrome.name = path
-    profile_directory = tempfile.mkdtemp()
-    with open(os.path.join(profile_directory, "First Run"), "wb") as firstrun:
-        # This file existing prevents prompts to make the new profile directory
-        # the default
-        firstrun.flush()
-    new_chrome.remote_args = webbrowser.Chrome.remote_args + [
-        '--user-data-dir="{}"'.format(profile_directory),
-        "--no-first-run",
-    ]
-    return new_chrome
+from faker import Faker
 
 
-def new_webbrowser_profile():
-    if is_command("google-chrome"):
-        return _make_chrome("google-chrome")
-    elif is_command("firefox"):
-        new_firefox = webbrowser.Mozilla()
-        new_firefox.name = "firefox"
-        profile_directory = tempfile.mkdtemp()
-        new_firefox.remote_args = [
-            "-profile",
-            profile_directory,
-            "-new-instance",
-            "-no-remote",
-            "-url",
-            "%s",
-        ]
-        return new_firefox
-    elif sys.platform == "darwin":
-        chrome_path = config.get("chrome-path")
-        if os.path.exists(chrome_path):
-            return _make_chrome(chrome_path)
-        else:
-            return webbrowser
-    else:
-        return webbrowser
+fake = Faker()
 
 
 def exclusion_policy():
@@ -79,7 +47,7 @@ def exclusion_policy():
     """
     patterns = set(
         [
-            os.path.join(".git", "*"),
+            ".git",
             "config.txt",
             "*.db",
             "*.dmg",
@@ -94,23 +62,133 @@ def exclusion_policy():
     return shutil.ignore_patterns(*patterns)
 
 
-def size_on_copy(root="."):
-    """Return the size of the experiment directory in bytes, excluding any
-    files and directories which would be excluded on copy.
+class ExperimentFileSource(object):
+    """Treat an experiment directory as a potential source of files for
+    copying to a temp directory as part of a deployment (debug or otherwise).
     """
-    total_size = 0
-    exclusions = exclusion_policy()
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
-        current_exclusions = exclusions(dirpath, os.listdir(dirpath))
-        # Modifying dirnames in-place will prune the subsequent files and
-        # directories visited by os.walk. This is only possible when
-        # topdown = True
-        dirnames[:] = [d for d in dirnames if d not in current_exclusions]
-        legit_files = [f for f in filenames if f not in current_exclusions]
-        for f in legit_files:
-            fp = os.path.join(dirpath, f)
-            total_size += os.path.getsize(fp)
-    return total_size
+
+    def __init__(self, root_dir="."):
+        self.root = root_dir
+        self.git = GitClient()
+
+    @property
+    def files(self):
+        """A Set of all files copyable in the source directory, accounting for
+        exclusions.
+        """
+        return {path for path in self._walk()}
+
+    @property
+    def size(self):
+        """Combined size of all files, accounting for exclusions.
+        """
+        return sum([os.path.getsize(path) for path in self._walk()])
+
+    def selective_copy_to(self, destination):
+        """Write files from the source directory to another directory, skipping
+        files excluded by the general exclusion_policy, plus any files
+        ignored by git configuration.
+        """
+        for path in self.files:
+            subpath = os.path.relpath(path, start=self.root)
+            target_folder = os.path.join(destination, os.path.dirname(subpath))
+            ensure_directory(target_folder)
+            shutil.copy2(path, target_folder)
+
+    def _walk(self):
+        # The GitClient and os.walk may return different representations of the
+        # same unicode characters, so we use unicodedata.normalize() for
+        # comparisons:
+        # list(name_from_git)
+        # ['å', ' ', 'f', 'i', 'l', 'e', '.', 't', 'x', 't']
+        # list(from_os_walk)
+        # ['a', '̊', ' ', 'f', 'i', 'l', 'e', '.', 't', 'x', 't']
+        exclusions = exclusion_policy()
+        git_files = {
+            os.path.join(self.root, normalize("NFC", f)) for f in self.git.files()
+        }
+        for dirpath, dirnames, filenames in os.walk(self.root, topdown=True):
+            current_exclusions = exclusions(dirpath, os.listdir(dirpath))
+            # Modifying dirnames in-place will prune the subsequent files and
+            # directories visited by os.walk. This is only possible when
+            # topdown = True
+            dirnames[:] = [d for d in dirnames if d not in current_exclusions]
+            legit_files = {
+                os.path.join(dirpath, f)
+                for f in filenames
+                if f not in current_exclusions
+            }
+            if git_files:
+                normalized = {
+                    normalize("NFC", six.text_type(f)): f for f in legit_files
+                }
+                legit_files = {v for k, v in normalized.items() if k in git_files}
+            for legit in legit_files:
+                yield legit
+
+
+class ExplicitFileSource(object):
+    """Add files that are explicitly requested by the experimenter with a hook function.
+    """
+
+    def __init__(self, root_dir="."):
+        self.root = root_dir
+
+    def _get_mapping(self, dst):
+        from dallinger.config import initialize_experiment_package
+
+        initialize_experiment_package(dst)
+        from dallinger.experiment import load
+
+        exp_class = load()
+        extra_files = getattr(exp_class, "extra_files", None)
+        if extra_files is None:
+            try:
+                from dallinger_experiment.experiment import extra_files
+            except ImportError:
+                try:
+                    from dallinger_experiment.dallinger_experiment import extra_files
+                except ImportError:
+                    pass
+
+        if extra_files is not None:
+            for src, filename in extra_files():
+                filename = filename.lstrip("/")
+                if os.path.isdir(src):
+                    for dirpath, dirnames, filenames in os.walk(src, topdown=True):
+                        for fn in filenames:
+                            dst_fileparts = [dst, filename] + dirnames + [fn]
+                            dst_filepath = os.path.join(*dst_fileparts)
+                            yield (
+                                os.path.join(dirpath, fn),
+                                dst_filepath,
+                            )
+                else:
+                    dst_filepath = os.path.join(dst, filename)
+                    yield (src, dst_filepath)
+
+    @property
+    def files(self):
+        """A Set of all files copyable in the source directory, accounting for
+        exclusions.
+        """
+        return {src for (src, dst) in self._get_mapping("")}
+
+    @property
+    def size(self):
+        """Combined size of all files, accounting for exclusions.
+        """
+        return sum([os.path.getsize(path) for path in self.files])
+
+    def selective_copy_to(self, destination):
+        """Write files from the source directory to another directory, skipping
+        files excluded by the general exclusion_policy, plus any files
+        ignored by git configuration.
+        """
+        for from_path, to_path in self._get_mapping(destination):
+            target_folder = os.path.dirname(to_path)
+            ensure_directory(target_folder)
+            shutil.copyfile(from_path, to_path)
 
 
 def assemble_experiment_temp_dir(config):
@@ -125,26 +203,33 @@ def assemble_experiment_temp_dir(config):
 
     Returns the absolute path of the new directory.
     """
-    app_id = config.get("id")
-    dst = os.path.join(tempfile.mkdtemp(), app_id)
+    exp_id = config.get("id")
+    dst = os.path.join(tempfile.mkdtemp(), exp_id)
 
     # Copy local experiment files, minus some
-    shutil.copytree(os.getcwd(), dst, ignore=exclusion_policy())
+    ExperimentFileSource(os.getcwd()).selective_copy_to(dst)
 
     # Export the loaded configuration
     config.write(filter_sensitive=True, directory=dst)
 
     # Save the experiment id
     with open(os.path.join(dst, "experiment_id.txt"), "w") as file:
-        file.write(app_id)
+        file.write(exp_id)
 
     # Copy Dallinger files
     dallinger_root = dallinger_package_path()
     ensure_directory(os.path.join(dst, "static", "scripts"))
     ensure_directory(os.path.join(dst, "static", "css"))
     frontend_files = [
+        os.path.join("static", "css", "bootstrap.min.css"),
         os.path.join("static", "css", "dallinger.css"),
+        os.path.join("static", "css", "dashboard.css"),
+        os.path.join("static", "scripts", "jquery-3.5.1.min.js"),
+        os.path.join("static", "scripts", "popper.min.js"),
+        os.path.join("static", "scripts", "bootstrap.min.js"),
+        os.path.join("static", "scripts", "clipboard.min.js"),
         os.path.join("static", "scripts", "dallinger2.js"),
+        os.path.join("static", "scripts", "network-monitor.js"),
         os.path.join("static", "scripts", "reqwest.min.js"),
         os.path.join("static", "scripts", "require.js"),
         os.path.join("static", "scripts", "reconnecting-websocket.js"),
@@ -158,6 +243,13 @@ def assemble_experiment_temp_dir(config):
         os.path.join("templates", "questionnaire.html"),
         os.path.join("templates", "thanks.html"),
         os.path.join("templates", "waiting.html"),
+        os.path.join("templates", "login.html"),
+        os.path.join("templates", "dashboard_lifecycle.html"),
+        os.path.join("templates", "dashboard_database.html"),
+        os.path.join("templates", "dashboard_heroku.html"),
+        os.path.join("templates", "dashboard_home.html"),
+        os.path.join("templates", "dashboard_monitor.html"),
+        os.path.join("templates", "dashboard_mturk.html"),
         os.path.join("static", "robots.txt"),
     ]
     frontend_dirs = [os.path.join("templates", "base")]
@@ -173,16 +265,22 @@ def assemble_experiment_temp_dir(config):
             shutil.copytree(src, dst_filepath)
 
     # Copy Heroku files
-    # heroku_files = ["Procfile", "runtime.txt"]
     heroku_files = ["Procfile"]
     for filename in heroku_files:
         src = os.path.join(dallinger_root, "heroku", filename)
         shutil.copy(src, os.path.join(dst, filename))
 
+    # Write out a runtime.txt file based on configuration
+    pyversion = config.get("heroku_python_version")
+    with open(os.path.join(dst, "runtime.txt"), "w") as file:
+        file.write("python-{}".format(pyversion))
+
     if not config.get("clock_on"):
         # If the clock process has been disabled, overwrite the Procfile:
         src = os.path.join(dallinger_root, "heroku", "Procfile_no_clock")
         shutil.copy(src, os.path.join(dst, "Procfile"))
+
+    ExplicitFileSource(os.getcwd()).selective_copy_to(dst)
 
     return dst
 
@@ -213,13 +311,8 @@ def setup_experiment(log, debug=True, verbose=False, app=None, exp_config=None):
     # Generate a unique id for this experiment.
     from dallinger.experiment import Experiment
 
-    generated_uid = public_id = Experiment.make_uuid(app)
-
-    # If the user provided an app name, use it everywhere that's user-facing.
-    if app:
-        public_id = str(app)
-
-    log("Experiment id is " + public_id + "")
+    experiment_uid = heroku_app_id = Experiment.make_uuid(app)
+    log("Experiment UID: {}".format(experiment_uid))
 
     # Load and update the config
     config = get_config()
@@ -227,7 +320,23 @@ def setup_experiment(log, debug=True, verbose=False, app=None, exp_config=None):
         config.load()  #
     if exp_config:
         config.extend(exp_config)
-    config.extend({"id": six.text_type(generated_uid)})
+
+    # If the user provided an app name, store it. We'll use it as the basis for
+    # the Heroku app ID. We still have a fair amount of ambiguity around what
+    # this value actually represents (it's not used as _only_ the Heroku app ID).
+    if app:
+        heroku_app_id = str(app)
+        log("Using custom Heroku ID root: {}".format(heroku_app_id))
+
+    config.extend(
+        {
+            "id": six.text_type(experiment_uid),
+            "heroku_app_id_root": six.text_type(heroku_app_id),
+        }
+    )
+
+    if not config.get("dashboard_password", None):
+        config.set("dashboard_password", fake.password(length=20, special_chars=False))
 
     temp_dir = assemble_experiment_temp_dir(config)
     log("Deployment temp directory: {}".format(temp_dir), chevrons=False)
@@ -236,15 +345,17 @@ def setup_experiment(log, debug=True, verbose=False, app=None, exp_config=None):
     if not debug:
         log("Freezing the experiment package...")
         shutil.make_archive(
-            os.path.join(os.getcwd(), "snapshots", public_id + "-code"), "zip", temp_dir
+            os.path.join(os.getcwd(), "snapshots", heroku_app_id + "-code"),
+            "zip",
+            temp_dir,
         )
 
-    return (public_id, temp_dir)
+    return (heroku_app_id, temp_dir)
 
 
-INITIAL_DELAY = 5
+INITIAL_DELAY = 1
 BACKOFF_FACTOR = 2
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 6
 
 
 def _handle_launch_data(url, error, delay=INITIAL_DELAY, attempts=MAX_ATTEMPTS):
@@ -255,14 +366,20 @@ def _handle_launch_data(url, error, delay=INITIAL_DELAY, attempts=MAX_ATTEMPTS):
             launch_data = launch_request.json()
         except ValueError:
             error(
-                "Error parsing response from /launch, "
-                "check web dyno logs for details: " + launch_request.text
+                "Error parsing response from {}, "
+                "check web dyno logs for details: {}".format(url, launch_request.text)
             )
             raise
 
         # Early return if successful
         if launch_request.ok:
             return launch_data
+
+        error(
+            "Error accessing {} ({}):\n{}".format(
+                url, launch_request.status_code, launch_request.text
+            )
+        )
 
         if remaining_attempt:
             delay = delay * BACKOFF_FACTOR
@@ -280,7 +397,9 @@ def _handle_launch_data(url, error, delay=INITIAL_DELAY, attempts=MAX_ATTEMPTS):
     launch_request.raise_for_status()
 
 
-def deploy_sandbox_shared_setup(log, verbose=True, app=None, exp_config=None):
+def deploy_sandbox_shared_setup(
+    log, verbose=True, app=None, exp_config=None, prelaunch_actions=None
+):
     """Set up Git, push to Heroku, and launch the app."""
     if verbose:
         out = None
@@ -291,13 +410,14 @@ def deploy_sandbox_shared_setup(log, verbose=True, app=None, exp_config=None):
     if not config.ready:
         config.load()
     heroku.sanity_check(config)
-
-    (id, tmp) = setup_experiment(log, debug=False, app=app, exp_config=exp_config)
+    (heroku_app_id, tmp) = setup_experiment(
+        log, debug=False, app=app, exp_config=exp_config
+    )
 
     # Register the experiment using all configured registration services.
     if config.get("mode") == "live":
         log("Registering the experiment on configured services...")
-        registration.register(id, snapshot=None)
+        registration.register(heroku_app_id, snapshot=None)
 
     # Log in to Heroku if we aren't already.
     log("Making sure that you are logged in to Heroku.")
@@ -313,12 +433,12 @@ def deploy_sandbox_shared_setup(log, verbose=True, app=None, exp_config=None):
     git = GitClient(output=out)
     git.init()
     git.add("--all")
-    git.commit('"Experiment {}"'.format(id))
+    git.commit('"Experiment {}"'.format(heroku_app_id))
 
     # Initialize the app on Heroku.
     log("Initializing app on Heroku...")
     team = config.get("heroku_team", None)
-    heroku_app = HerokuApp(dallinger_uid=id, output=out, team=team)
+    heroku_app = HerokuApp(dallinger_uid=heroku_app_id, output=out, team=team)
     heroku_app.bootstrap()
     heroku_app.buildpack("https://github.com/stomita/heroku-buildpack-phantomjs")
     heroku_app.set("PYTHON_NO_SQLITE3", "true")
@@ -345,73 +465,97 @@ def deploy_sandbox_shared_setup(log, verbose=True, app=None, exp_config=None):
         "smtp_username": config["smtp_username"],
         "smtp_password": config["smtp_password"],
         "whimsical": config["whimsical"],
+        "FLASK_SECRET_KEY": codecs.encode(os.urandom(16), "hex").decode("ascii"),
     }
+
+    # Set up the preferred class as an environment variable, if one is set
+    # This is needed before the config is parsed, but we also store it in the
+    # config to make things easier for recording into bundles.
+    preferred_class = config.get("EXPERIMENT_CLASS_NAME", None)
+    if preferred_class:
+        heroku_config["EXPERIMENT_CLASS_NAME"] = preferred_class
 
     heroku_app.set_multiple(**heroku_config)
 
     # Wait for Redis database to be ready.
-    log("Waiting for Redis...")
+    log("Waiting for Redis...", nl=False)
     ready = False
     while not ready:
         try:
-            r = redis.from_url(heroku_app.redis_url)
+            r = connect_to_redis(url=heroku_app.redis_url)
             r.set("foo", "bar")
             ready = True
+            log("\n✓ connected at {}".format(heroku_app.redis_url), chevrons=False)
         except (ValueError, redis.exceptions.ConnectionError):
             time.sleep(2)
+            log(".", chevrons=False, nl=False)
 
     log("Saving the URL of the postgres database...")
     config.extend({"database_url": heroku_app.db_url})
     config.write()
     git.add("config.txt")
-    time.sleep(0.25)
     git.commit("Save URL for database")
-    time.sleep(0.25)
+
+    log("Generating dashboard links...")
+    heroku_addons = heroku_app.addon_parameters()
+    heroku_addons = json.dumps(heroku_addons)
+    if six.PY2:
+        heroku_addons = heroku_addons.decode("utf-8")
+    config.extend({"infrastructure_debug_details": heroku_addons})
+    config.write()
+    git.add("config.txt")
+    git.commit("Save URLs for heroku addon management")
 
     # Launch the Heroku app.
     log("Pushing code to Heroku...")
     git.push(remote="heroku", branch="HEAD:master")
 
     log("Scaling up the dynos...")
-    size = config.get("dyno_type")
+    default_size = config.get("dyno_type")
     for process in ["web", "worker"]:
+        size = config.get("dyno_type_" + process, default_size)
         qty = config.get("num_dynos_" + process)
         heroku_app.scale_up_dyno(process, qty, size)
     if config.get("clock_on"):
         heroku_app.scale_up_dyno("clock", 1, size)
 
-    time.sleep(8)
+    if prelaunch_actions is not None:
+        for task in prelaunch_actions:
+            task(heroku_app, config)
 
     # Launch the experiment.
     log("Launching the experiment on the remote server and starting recruitment...")
-    launch_data = _handle_launch_data("{}/launch".format(heroku_app.url), error=log)
+    launch_url = "{}/launch".format(heroku_app.url)
+    log("Calling {}".format(launch_url), chevrons=False)
+    launch_data = _handle_launch_data(launch_url, error=log)
     result = {
         "app_name": heroku_app.name,
         "app_home": heroku_app.url,
+        "dashboard_url": "{}/dashboard/".format(heroku_app.url),
         "recruitment_msg": launch_data.get("recruitment_msg", None),
     }
+
     log("Experiment details:")
     log("App home: {}".format(result["app_home"]), chevrons=False)
+    log("Dashboard URL: {}".format(result["dashboard_url"]), chevrons=False)
+    log("Dashboard user: {}".format(config.get("dashboard_user")), chevrons=False)
+    log(
+        "Dashboard password: {}".format(config.get("dashboard_password")),
+        chevrons=False,
+    )
+
     log("Recruiter info:")
     log(result["recruitment_msg"], chevrons=False)
 
     # Return to the branch whence we came.
     os.chdir(cwd)
 
-    log("Completed deployment of experiment " + id + ".")
+    log(
+        "Completed Heroku deployment of experiment ID {} using app ID {}.".format(
+            config.get("id"), heroku_app_id
+        )
+    )
     return result
-
-
-def _deploy_in_mode(mode, app, verbose, log):
-    # Load configuration.
-    config = get_config()
-    config.load()
-
-    # Set the mode.
-    config.extend({"mode": mode, "logfile": u"-"})
-
-    # Do shared setup.
-    deploy_sandbox_shared_setup(log, verbose=verbose, app=app)
 
 
 class HerokuLocalDeployment(object):
@@ -419,9 +563,10 @@ class HerokuLocalDeployment(object):
     exp_id = None
     tmp_dir = None
     dispatch = {}  # Subclass may provide handlers for Heroku process output
+    environ = None
 
     def configure(self):
-        self.exp_config.update({"mode": u"debug", "loglevel": 0})
+        self.exp_config.update({"mode": "debug", "loglevel": 0})
 
     def setup(self):
         self.exp_id, self.tmp_dir = setup_experiment(
@@ -436,7 +581,7 @@ class HerokuLocalDeployment(object):
         if logfile and logfile != "-":
             logfile = os.path.join(self.original_dir, logfile)
             config.extend({"logfile": logfile})
-            config.write()
+        config.write()
 
     def run(self):
         """Set up the environment, get a HerokuLocalWrapper instance, and pass
@@ -446,9 +591,15 @@ class HerokuLocalDeployment(object):
         self.setup()
         self.update_dir()
         db.init_db(drop_all=True)
-        self.out.log("Starting up the server...")
         config = get_config()
-        with HerokuLocalWrapper(config, self.out, verbose=self.verbose) as wrapper:
+        environ = None
+        if self.environ:
+            environ = os.environ.copy()
+            environ.update(self.environ)
+        self.out.log("Starting up the Heroku Local server...")
+        with HerokuLocalWrapper(
+            config, self.out, verbose=self.verbose, env=environ
+        ) as wrapper:
             try:
                 self.execute(wrapper)
             except KeyboardInterrupt:
@@ -479,7 +630,7 @@ class DebugDeployment(HerokuLocalDeployment):
         r"{}".format(recruiters.CLOSE_RECRUITMENT_LOG_PREFIX): "recruitment_closed",
     }
 
-    def __init__(self, output, verbose, bot, proxy_port, exp_config):
+    def __init__(self, output, verbose, bot, proxy_port, exp_config, no_browsers=False):
         self.out = output
         self.verbose = verbose
         self.bot = bot
@@ -488,6 +639,10 @@ class DebugDeployment(HerokuLocalDeployment):
         self.original_dir = os.getcwd()
         self.complete = False
         self.status_thread = None
+        self.no_browsers = no_browsers
+        self.environ = {
+            "FLASK_SECRET_KEY": codecs.encode(os.urandom(16), "hex").decode("ascii"),
+        }
 
     def configure(self):
         super(DebugDeployment, self).configure()
@@ -498,10 +653,9 @@ class DebugDeployment(HerokuLocalDeployment):
         base_url = get_base_url()
         self.out.log("Server is running on {}. Press Ctrl+C to exit.".format(base_url))
         self.out.log("Launching the experiment...")
-        time.sleep(4)
         try:
             result = _handle_launch_data(
-                "{}/launch".format(base_url), error=self.out.error
+                "{}/launch".format(base_url), error=self.out.error, attempts=1
             )
         except Exception:
             # Show output from server
@@ -510,7 +664,14 @@ class DebugDeployment(HerokuLocalDeployment):
         else:
             if result["status"] == "success":
                 self.out.log(result["recruitment_msg"])
+                dashboard_url = "{}/dashboard/".format(get_base_url())
+                self.display_dashboard_access_details(dashboard_url)
+                if not self.no_browsers:
+                    self.open_dashboard(dashboard_url)
                 self.heroku = heroku
+                self.out.log(
+                    "Monitoring the Heroku Local server for recruitment or completion..."
+                )
                 heroku.monitor(listener=self.notify)
 
     def launch_request_complete(self, match):
@@ -526,17 +687,40 @@ class DebugDeployment(HerokuLocalDeployment):
         person doing local debugging).
         """
         self.out.log("new recruitment request!")
+        if self.no_browsers:
+            self.out.log(recruiters.NEW_RECRUIT_LOG_PREFIX + ": " + match.group(1))
+            return
         url = match.group(1)
         if self.proxy_port is not None:
             self.out.log("Using proxy port {}".format(self.proxy_port))
             url = url.replace(str(get_config().get("base_port")), self.proxy_port)
-        new_webbrowser_profile().open(url, new=1, autoraise=True)
+        open_browser(url)
+
+    def display_dashboard_access_details(self, url):
+        config = get_config()
+        self.out.log("Experiment dashboard: {}".format(url))
+        self.out.log(
+            "Dashboard user: {} password: {}".format(
+                config.get("dashboard_user"), config.get("dashboard_password"),
+            )
+        )
+
+    def open_dashboard(self, url):
+        config = get_config()
+        self.out.log("Opening dashboard")
+        parsed = list(urlparse(url))
+        parsed[1] = "{}:{}@{}".format(
+            config.get("dashboard_user"), config.get("dashboard_password"), parsed[1],
+        )
+        open_browser(urlunparse(parsed))
 
     def recruitment_closed(self, match):
         """Recruitment is closed.
 
         Start a thread to check the experiment summary.
         """
+        if self.no_browsers:
+            self.out.log(recruiters.CLOSE_RECRUITMENT_LOG_PREFIX)
         if self.status_thread is None:
             self.status_thread = threading.Thread(target=self.check_status)
             self.status_thread.start()
@@ -587,7 +771,7 @@ class LoaderDeployment(HerokuLocalDeployment):
         self.zip_path = None
 
     def configure(self):
-        self.exp_config.update({"mode": u"debug", "loglevel": 0})
+        self.exp_config.update({"mode": "debug", "loglevel": 0})
 
         self.zip_path = data.find_experiment_export(self.app_id)
         if self.zip_path is None:
@@ -628,7 +812,7 @@ class LoaderDeployment(HerokuLocalDeployment):
         """
         self.out.log("replay ready!")
         url = match.group(1)
-        new_webbrowser_profile().open(url, new=1, autoraise=True)
+        open_browser(url)
 
     def cleanup(self):
         self.out.log("Terminating dataset load for experiment {}".format(self.exp_id))

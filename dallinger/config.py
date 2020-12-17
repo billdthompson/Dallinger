@@ -4,6 +4,8 @@ from collections import deque
 from contextlib import contextmanager
 from six.moves import configparser
 import distutils.util
+import io
+import json
 import logging
 import os
 import six
@@ -15,6 +17,11 @@ marker = object()
 
 LOCAL_CONFIG = "config.txt"
 SENSITIVE_KEY_NAMES = ("access_id", "access_key", "password", "secret", "token")
+
+
+def is_valid_json(value):
+    json.loads(value)
+
 
 default_keys = (
     ("ad_group", six.text_type, []),
@@ -31,16 +38,25 @@ default_keys = (
     ("contact_email_on_error", six.text_type, []),
     ("chrome-path", six.text_type, []),
     ("dallinger_email_address", six.text_type, []),
+    ("dashboard_password", six.text_type, [], True),
+    ("dashboard_user", six.text_type, [], True),
     ("database_size", six.text_type, []),
     ("database_url", six.text_type, [], True),
     ("description", six.text_type, []),
     ("duration", float, []),
     ("dyno_type", six.text_type, []),
+    ("dyno_type_web", six.text_type, []),
+    ("dyno_type_worker", six.text_type, []),
+    ("enable_global_experiment_registry", bool, []),
+    ("EXPERIMENT_CLASS_NAME", six.text_type, []),
     ("group_name", six.text_type, []),
+    ("heroku_app_id_root", six.text_type, []),
     ("heroku_auth_token", six.text_type, [], True),
+    ("heroku_python_version", six.text_type, []),
     ("heroku_team", six.text_type, ["team"]),
     ("host", six.text_type, []),
     ("id", six.text_type, []),
+    ("infrastructure_debug_details", six.text_type, [], False),
     ("keywords", six.text_type, []),
     ("lifetime", int, []),
     ("logfile", six.text_type, []),
@@ -50,7 +66,8 @@ default_keys = (
     ("num_dynos_worker", int, []),
     ("organization_name", six.text_type, []),
     ("port", int, ["PORT"]),
-    ("qualification_blacklist", six.text_type, []),
+    ("mturk_qualification_blocklist", six.text_type, ["qualification_blacklist"]),
+    ("mturk_qualification_requirements", six.text_type, [], False, [is_valid_json]),
     ("recruiter", six.text_type, []),
     ("recruiters", six.text_type, []),
     ("redis_size", six.text_type, []),
@@ -61,6 +78,7 @@ default_keys = (
     ("smtp_password", six.text_type, ["dallinger_email_password"], True),
     ("threads", six.text_type, []),
     ("title", six.text_type, []),
+    ("question_max_length", int, []),
     ("us_only", bool, []),
     ("webdriver_type", six.text_type, []),
     ("webdriver_url", six.text_type, []),
@@ -87,6 +105,7 @@ class Configuration(object):
         self.clear()
         self.types = {}
         self.synonyms = {}
+        self.validators = {}
         self.sensitive = set()
         if register_defaults:
             for registration in default_keys:
@@ -104,6 +123,11 @@ class Configuration(object):
                 continue
             expected_type = self.types.get(key)
             if cast_types:
+                if isinstance(value, six.text_type) and value.startswith("file:"):
+                    # Load this value from a file
+                    _, filename = value.split(":", 1)
+                    with io.open(filename, "rt", encoding="utf-8") as source_file:
+                        value = source_file.read()
                 try:
                     if expected_type == bool:
                         value = distutils.util.strtobool(value)
@@ -116,6 +140,14 @@ class Configuration(object):
                         value=repr(value), key=key, expected_type=expected_type
                     )
                 )
+            for validator in self.validators.get(key, []):
+                try:
+                    validator(value)
+                except ValueError as e:
+                    # Annotate the exception with more info
+                    e.dallinger_config_key = key
+                    e.dallinger_config_value = value
+                    raise e
             normalized_mapping[key] = value
         self.data.extendleft([normalized_mapping])
 
@@ -168,7 +200,7 @@ class Configuration(object):
         # Also, does a sensitive string appear within the key?
         return any(s for s in SENSITIVE_KEY_NAMES if s in key)
 
-    def register(self, key, type_, synonyms=None, sensitive=False):
+    def register(self, key, type_, synonyms=None, sensitive=False, validators=None):
         if synonyms is None:
             synonyms = set()
         if key in self.types:
@@ -178,6 +210,9 @@ class Configuration(object):
         self.types[key] = type_
         for synonym in synonyms:
             self.synonyms[synonym] = key
+
+        if validators:
+            self.validators[key] = validators
 
         if sensitive:
             self.sensitive.add(key)
@@ -197,7 +232,7 @@ class Configuration(object):
             for k, v in layer.items():
                 if filter_sensitive and self.is_sensitive(k):
                     continue
-                parser.set("Parameters", k, str(v))
+                parser.set("Parameters", k, six.text_type(v))
 
         directory = directory or os.getcwd()
         destination = os.path.join(directory, LOCAL_CONFIG)
@@ -281,7 +316,11 @@ def initialize_experiment_package(path):
     sys.path.insert(0, dirname)
     package = __import__(basename)
     if path not in package.__path__:
-        raise Exception("Package was not imported from the requested path!")
+        raise Exception(
+            "Package was not imported from the requested path! ({} not in {})".format(
+                path, package.__path__
+            )
+        )
     sys.modules["dallinger_experiment"] = package
     package.__package__ = "dallinger_experiment"
     sys.path.pop(0)

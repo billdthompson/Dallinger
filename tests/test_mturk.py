@@ -8,11 +8,14 @@ import socket
 import time
 from botocore.exceptions import ClientError
 from hashlib import sha1
+from tzlocal import get_localzone
 from dallinger.mturk import DuplicateQualificationNameError
 from dallinger.mturk import MTurkService
 from dallinger.mturk import MTurkServiceException
 from dallinger.mturk import SNSService
 from dallinger.mturk import WorkerLacksQualification
+from dallinger.mturk import MTurkQualificationRequirements
+from dallinger.mturk import MTurkQuestions
 from dallinger.mturk import RevokedQualification
 from dallinger.mturk import QualificationNotFoundException
 from dallinger.utils import generate_random_id
@@ -103,13 +106,16 @@ def fake_hit_type_response():
 
 
 def fake_hit_response(**kwargs):
+    tz = get_localzone()
     canned_response = {
         u"HIT": {
             u"AssignmentDurationInSeconds": 900,
             u"AutoApprovalDelayInSeconds": 0,
-            u"CreationTime": datetime.datetime(2018, 1, 1, 1, 26, 52, 54000),
+            u"CreationTime": tz.localize(
+                datetime.datetime(2018, 1, 1, 1, 26, 52, 54000)
+            ),
             u"Description": u"***TEST SUITE HIT***43683",
-            u"Expiration": datetime.datetime(2018, 1, 1, 1, 27, 26, 54000),
+            u"Expiration": tz.localize(datetime.datetime(2018, 1, 1, 1, 27, 26, 54000)),
             u"HITGroupId": u"36IAL8HYPYM1MDNBSTAEZW89WH74RJ",
             u"HITId": u"3X7837UUADRXYCA1K7JAJLKC66DJ60",
             u"HITReviewStatus": u"NotReviewed",
@@ -159,9 +165,10 @@ def fake_list_hits_responses(hits=None):
 
 
 def fake_worker_qualification_response():
+    tz = get_localzone()
     canned_response = {
         u"Qualification": {
-            u"GrantTime": datetime.datetime(2018, 1, 1),
+            u"GrantTime": tz.localize(datetime.datetime(2018, 1, 1)),
             u"IntegerValue": 2,
             u"QualificationTypeId": six.text_type(generate_random_id(size=32)),
             u"Status": u"Granted",
@@ -183,10 +190,11 @@ def fake_list_worker_qualification_responses(quals=None):
 
 
 def fake_qualification_type_response():
+    tz = get_localzone()
     canned_response = {
         u"QualificationType": {
             u"AutoGranted": False,
-            u"CreationTime": datetime.datetime(2018, 1, 1),
+            u"CreationTime": tz.localize(datetime.datetime(2018, 1, 1)),
             u"Description": u"***TEST SUITE QUALIFICATION***",
             u"IsRequestable": True,
             u"Name": u"Test Qualification",
@@ -207,6 +215,7 @@ def fake_list_qualification_types_responses(qtypes=None):
 
 
 def fake_get_assignment_response():
+    tz = get_localzone()
     hit = fake_hit_response()["HIT"]
     return {
         "Assignment": {
@@ -214,12 +223,12 @@ def fake_get_assignment_response():
             "WorkerId": "FAKE_WORKER_ID",
             "HITId": hit["HITId"],
             "AssignmentStatus": "Approved",
-            "AutoApprovalTime": datetime.datetime(2018, 1, 1),
-            "AcceptTime": datetime.datetime(2018, 1, 1),
-            "SubmitTime": datetime.datetime(2018, 1, 1),
-            "ApprovalTime": datetime.datetime(2018, 1, 1),
-            "RejectionTime": datetime.datetime(2018, 1, 1),
-            "Deadline": datetime.datetime(2018, 1, 1),
+            "AutoApprovalTime": tz.localize(datetime.datetime(2018, 1, 1)),
+            "AcceptTime": tz.localize(datetime.datetime(2018, 1, 1)),
+            "SubmitTime": tz.localize(datetime.datetime(2018, 1, 1)),
+            "ApprovalTime": tz.localize(datetime.datetime(2018, 1, 1)),
+            "RejectionTime": tz.localize(datetime.datetime(2018, 1, 1)),
+            "Deadline": tz.localize(datetime.datetime(2018, 1, 1)),
             "Answer": "",
             "RequesterFeedback": "",
         },
@@ -230,16 +239,19 @@ def fake_get_assignment_response():
 def standard_hit_config(**kwargs):
     defaults = {
         "experiment_id": "some-experiment-id",
-        "ad_url": "https://url-of-ad-route",
-        "approve_requirement": 95,
-        "us_only": True,
         "lifetime_days": 0.0004,  # 34 seconds (30 is minimum)
         "max_assignments": 1,
         "notification_url": "https://url-of-notification-route",
         "title": "Test Title",
         "keywords": ["testkw1", "testkw2"],
         "reward": 0.01,
+        "question": MTurkQuestions.external(ad_url="https://url-of-ad-route"),
         "duration_hours": 0.25,
+        "qualifications": [
+            MTurkQualificationRequirements.min_approval(95),
+            MTurkQualificationRequirements.restrict_to_countries(["US"]),
+        ],
+        "do_subscribe": False,
     }
     defaults.update(**kwargs)
     # Use fixed description, since this is how we clean up:
@@ -267,7 +279,7 @@ def with_cleanup(aws_creds, request):
 
     # In tests we do a lot of querying of Qualifications we only just created,
     # so we need a long time-out
-    params = {"region_name": "us-east-1", "max_wait_secs": 60, "subscribe": False}
+    params = {"region_name": "us-east-1", "max_wait_secs": 60}
     params.update(aws_creds)
     service = MTurkService(**params)
     service.sns = mock.Mock(spec=SNSService)
@@ -358,6 +370,12 @@ class TestSNSService(object):
         assert topic_arn.endswith(":some-exp")
         assert sns.cancel_subscription("some-exp")
 
+    def test_cancel_nonexistent_subscription_raises(self, sns):
+        from dallinger.mturk import NonExistentSubscription
+
+        with pytest.raises(NonExistentSubscription):
+            sns.cancel_subscription("some-exp")
+
 
 class TestSNSServiceIsolation(object):
     def test_create_subscription(self, sns_iso):
@@ -401,8 +419,12 @@ class TestMTurkServiceIntegrationSmokeTest(object):
 
         assert result["score"] == 3
 
+        qualifications = (MTurkQualificationRequirements.must_have(qtype["id"]),)
+
         config = standard_hit_config(
-            max_assignments=2, blacklist=[qtype["name"]], annotation="test-annotation"
+            max_assignments=2,
+            annotation="test-annotation",
+            qualifications=qualifications,
         )
         hit = with_cleanup.create_hit(**config)
         assert hit["status"] == "Assignable"
@@ -455,6 +477,10 @@ class TestMTurkService(object):
             time.sleep(1)
         return True
 
+    def test_account_balance(self, mturk):
+        balance = mturk.account_balance()
+        assert balance == 10000.0
+
     def test_check_credentials_good_credentials(self, mturk):
         is_authenticated = mturk.check_credentials()
         assert is_authenticated
@@ -471,19 +497,6 @@ class TestMTurkService(object):
         with pytest.raises(MTurkServiceException):
             mturk.check_credentials()
 
-    def test_register_hit_type(self, mturk):
-        config = {
-            "title": "Test Title",
-            "description": "Test Description",
-            "keywords": ["testkw1", "testkw2"],
-            "reward": 0.01,
-            "duration_hours": 0.25,
-            "qualifications": mturk.build_hit_qualifications(95, True, None),
-        }
-        hit_type_id = mturk.register_hit_type(**config)
-
-        assert isinstance(hit_type_id, six.text_type)
-
     def test_create_hit(self, with_cleanup):
         hit = with_cleanup.create_hit(**standard_hit_config())
         assert hit["status"] == "Assignable"
@@ -498,9 +511,25 @@ class TestMTurkService(object):
         hit = with_cleanup.create_hit(**standard_hit_config(annotation="test-exp-id"))
         assert hit["annotation"] == "test-exp-id"
 
-    def test_create_hit_with_valid_blacklist(self, with_cleanup, qtype):
-        hit = with_cleanup.create_hit(**standard_hit_config(blacklist=[qtype["name"]]))
+    def test_create_hit_with_qualification(self, with_cleanup, qtype):
+        qual = MTurkQualificationRequirements.must_not_have(
+            qualification_id=qtype["id"]
+        )
+        hit = with_cleanup.create_hit(**standard_hit_config(qualifications=[qual]))
         assert hit["status"] == "Assignable"
+        assert hit["qualification_type_ids"] == [qtype["id"]]
+
+    def test_create_compensation_hit(self, with_cleanup):
+        # In practice, this would include a qualification assigned to a
+        # single worker.
+        hit = with_cleanup.create_hit(
+            **standard_hit_config(
+                title="Compensation Immediate",
+                question=MTurkQuestions.compensation(sandbox=True),
+            )
+        )
+        assert hit["status"] == "Assignable"
+        assert hit["max_assignments"] == 1
 
     def test_extend_hit_with_valid_hit_id(self, with_cleanup):
         hit = with_cleanup.create_hit(**standard_hit_config())
@@ -617,7 +646,7 @@ class TestMTurkServiceWithRequesterAndWorker(object):
 
     def test_can_update_existing_qualification(self, with_cleanup, worker_id, qtype):
         with_cleanup.assign_qualification(qtype["id"], worker_id, score=2)
-        with_cleanup.update_qualification_score(qtype["id"], worker_id, score=3)
+        with_cleanup.assign_qualification(qtype["id"], worker_id, score=3)
 
         assert with_cleanup.get_qualification_score(qtype["id"], worker_id) == 3
 
@@ -642,21 +671,6 @@ class TestMTurkServiceWithRequesterAndWorker(object):
         workers = with_cleanup.get_workers_with_qualification(qtype["id"])
 
         assert worker_id in [w["id"] for w in workers]
-
-    def test_set_qualification_score_with_new_qualification(
-        self, with_cleanup, worker_id, qtype
-    ):
-        with_cleanup.set_qualification_score(qtype["id"], worker_id, score=2)
-
-        assert with_cleanup.get_qualification_score(qtype["id"], worker_id) == 2
-
-    def test_set_qualification_score_with_existing_qualification(
-        self, with_cleanup, worker_id, qtype
-    ):
-        with_cleanup.assign_qualification(qtype["id"], worker_id, score=2)
-        with_cleanup.set_qualification_score(qtype["id"], worker_id, score=3)
-
-        assert with_cleanup.get_qualification_score(qtype["id"], worker_id) == 3
 
     def test_get_current_qualification_score(self, with_cleanup, worker_id, qtype):
         with_cleanup.assign_qualification(qtype["id"], worker_id, score=2)
@@ -732,7 +746,7 @@ class TestMTurkServiceWithRequesterAndWorker(object):
 )
 @pytest.mark.slow
 class TestInteractive(object):
-    def test_worker_can_see_hit_when_blacklist_not_in_qualifications(
+    def test_worker_can_see_hit_when_blocklist_not_in_qualifications(
         self, with_cleanup, worker_id, qtype
     ):
         with_cleanup.assign_qualification(qtype["id"], worker_id, score=1)
@@ -744,7 +758,7 @@ class TestInteractive(object):
         input("Any key to continue...")
 
         hit = with_cleanup.create_hit(
-            **standard_hit_config(title="Dallinger: No Blacklist", lifetime_days=0.25)
+            **standard_hit_config(title="Dallinger: No Blocklist", lifetime_days=0.25)
         )
 
         print(
@@ -754,7 +768,7 @@ class TestInteractive(object):
         )
         input("Any key to continue...")
 
-    def test_worker_cannot_see_hit_when_blacklist_in_qualifications(
+    def test_worker_cannot_see_hit_when_blocklist_in_qualifications(
         self, with_cleanup, worker_id, qtype
     ):
         with_cleanup.assign_qualification(qtype["id"], worker_id, score=1)
@@ -768,8 +782,10 @@ class TestInteractive(object):
 
         hit = with_cleanup.create_hit(
             **standard_hit_config(
-                title="Dallinger: Blacklist",
-                blacklist=[qtype["name"]],
+                title="Dallinger: Blocklist",
+                qualifications=[
+                    MTurkQualificationRequirements.must_not_have(qtype["id"])
+                ],
                 lifetime_days=0.25,
             )
         )
@@ -837,21 +853,6 @@ class TestMTurkServiceWithFakeConnection(object):
         with pytest.raises(MTurkServiceException):
             service.check_credentials()
 
-    def test_build_hit_qualifications_with_blacklist(self, with_mock):
-        qtypes = fake_list_qualification_types_responses()
-        qtype_id = qtypes[0]["QualificationTypes"][0]["QualificationTypeId"]
-        with_mock.mturk.list_qualification_types.side_effect = qtypes
-        quals = with_mock.build_hit_qualifications(95, False, blacklist=[qtype_id])
-        assert quals[-1]["QualificationTypeId"] == qtype_id
-        assert quals[-1]["Comparator"] == "DoesNotExist"
-
-    def test_build_hit_qualifications_with_region_restriction(self, with_mock):
-        quals = with_mock.build_hit_qualifications(
-            95, restrict_to_usa=True, blacklist=None
-        )
-        assert quals[-1]["Comparator"] == "EqualTo"
-        assert quals[-1]["LocaleValues"] == [{"Country": "US"}]
-
     def test_get_qualification_type_by_name_with_invalid_name_returns_none(
         self, with_mock
     ):
@@ -887,37 +888,6 @@ class TestMTurkServiceWithFakeConnection(object):
         name = qtypes[0]["QualificationTypes"][0]["Name"]
         assert with_mock.get_qualification_type_by_name(name)["name"] == name
 
-    def test_register_hit_type(self, with_mock):
-        quals = with_mock.build_hit_qualifications(95, True, None)
-        config = {
-            "title": "Test Title",
-            "description": "Test Description",
-            "keywords": ["testkw1", "testkw2"],
-            "reward": 0.01,
-            "duration_hours": 0.25,
-            "qualifications": quals,
-        }
-        with_mock.mturk.configure_mock(
-            **{
-                "get_account_balance.return_value": fake_balance_response(),
-                "create_hit_type.return_value": fake_hit_type_response(),
-            }
-        )
-
-        with_mock.register_hit_type(**config)
-
-        with_mock.mturk.create_hit_type.assert_called_once_with(
-            Title="Test Title",
-            Description="Test Description",
-            Reward="0.01",
-            AssignmentDurationInSeconds=int(
-                datetime.timedelta(hours=0.25).total_seconds()
-            ),
-            Keywords="testkw1,testkw2",
-            AutoApprovalDelayInSeconds=0,
-            QualificationRequirements=quals,
-        )
-
     def test_get_assignment_converts_result(self, with_mock):
         fake_response = fake_get_assignment_response()
         with_mock.mturk.get_assignment = mock.Mock(return_value=fake_response)
@@ -951,6 +921,7 @@ class TestMTurkServiceWithFakeConnection(object):
         with_mock.mturk.create_hit_with_hit_type.assert_called_once()
 
     def test_create_hit_translates_response_back_from_mturk(self, with_mock):
+        tz = get_localzone()
         with_mock.mturk.configure_mock(
             **{
                 "create_hit_type.return_value": fake_hit_type_response(),
@@ -960,13 +931,27 @@ class TestMTurkServiceWithFakeConnection(object):
 
         hit = with_mock.create_hit(**standard_hit_config())
 
-        assert hit["max_assignments"] == 1
-        assert hit["reward"] == 0.01
-        assert hit["keywords"] == ["testkw1", "testkw2"]
-        assert isinstance(hit["created"], datetime.datetime)
-        assert isinstance(hit["expiration"], datetime.datetime)
+        assert hit == {
+            "annotation": None,
+            "assignments_available": 1,
+            "assignments_completed": 0,
+            "assignments_pending": 0,
+            "created": tz.localize(datetime.datetime(2018, 1, 1, 1, 26, 52, 54000)),
+            "description": "***TEST SUITE HIT***43683",
+            "expiration": tz.localize(datetime.datetime(2018, 1, 1, 1, 27, 26, 54000)),
+            "id": "3X7837UUADRXYCA1K7JAJLKC66DJ60",
+            "keywords": ["testkw1", "testkw2"],
+            "max_assignments": 1,
+            "qualification_type_ids": ["000000000000000000L0", "00000000000000000071"],
+            "review_status": "NotReviewed",
+            "reward": 0.01,
+            "status": "Assignable",
+            "title": "Test Title",
+            "type_id": "3V76OXST9SAE3THKN85FUPK7730050",
+            "worker_url": "https://workersandbox.mturk.com/projects/3V76OXST9SAE3THKN85FUPK7730050/tasks",
+        }
 
-    def test_create_hit_also_creates_sns_subscription(self, with_mock):
+    def test_create_hit_creates_no_sns_subscription_when_asked_not_to(self, with_mock):
         with_mock.mturk.configure_mock(
             **{
                 "create_hit_type.return_value": fake_hit_type_response(),
@@ -974,7 +959,19 @@ class TestMTurkServiceWithFakeConnection(object):
             }
         )
 
-        with_mock.create_hit(**standard_hit_config())
+        with_mock.create_hit(**standard_hit_config(do_subscribe=False))
+
+        with_mock.sns.create_subscription.assert_not_called()
+
+    def test_create_hit_creates_sns_subscription_when_asked(self, with_mock):
+        with_mock.mturk.configure_mock(
+            **{
+                "create_hit_type.return_value": fake_hit_type_response(),
+                "create_hit_with_hit_type.return_value": fake_hit_response(),
+            }
+        )
+
+        with_mock.create_hit(**standard_hit_config(do_subscribe=True))
 
         with_mock.sns.create_subscription.assert_called_once_with(
             "some-experiment-id", "https://url-of-notification-route"
@@ -1085,6 +1082,20 @@ class TestMTurkServiceWithFakeConnection(object):
         assert len(hits) == 1
         assert hits[0]["title"] == "HIT Two"
 
+    def test_get_hits_copes_with_no_keywords(self, with_mock):
+        # HITs created directly through the MTurk web UI
+        # may have no Keywords at all, so we need to account for this when
+        # parsing HITs.
+        hr1 = fake_hit_response(Title="One")
+        del hr1["HIT"]["Keywords"]
+        responses = fake_list_hits_responses([hr1])
+        with_mock.mturk.configure_mock(**{"list_hits.side_effect": responses})
+
+        hits = list(with_mock.get_hits())
+
+        assert len(hits) == 1
+        assert hits[0]["keywords"] == []
+
     def test_grant_bonus_translates_values_and_calls_wrapped_mturk(self, with_mock):
         with_mock.mturk.configure_mock(
             **{
@@ -1170,30 +1181,6 @@ class TestMTurkServiceWithFakeConnection(object):
             **{"associate_qualification_with_worker.return_value": response_metadata()}
         )
         assert with_mock.assign_qualification("qid", "worker", "score")
-        with_mock.mturk.associate_qualification_with_worker.assert_called_once_with(
-            IntegerValue="score",
-            QualificationTypeId="qid",
-            SendNotification=False,
-            WorkerId="worker",
-        )
-
-    def test_update_qualification_score(self, with_mock):
-        with_mock.mturk.configure_mock(
-            **{"associate_qualification_with_worker.return_value": response_metadata()}
-        )
-        assert with_mock.update_qualification_score("qid", "worker", "score")
-        with_mock.mturk.associate_qualification_with_worker.assert_called_once_with(
-            IntegerValue="score",
-            QualificationTypeId="qid",
-            SendNotification=False,
-            WorkerId="worker",
-        )
-
-    def test_set_qualification_score_forwards_for_bbb(self, with_mock):
-        with_mock.mturk.configure_mock(
-            **{"associate_qualification_with_worker.return_value": response_metadata()}
-        )
-        assert with_mock.set_qualification_score("qid", "worker", "score")
         with_mock.mturk.associate_qualification_with_worker.assert_called_once_with(
             IntegerValue="score",
             QualificationTypeId="qid",

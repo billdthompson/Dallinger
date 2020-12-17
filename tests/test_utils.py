@@ -1,9 +1,12 @@
+# -*- coding: utf-8 -*-
 import io
+import locale
 import mock
 import pytest
+import tempfile
 from datetime import datetime
 from datetime import timedelta
-from dallinger import utils
+from dallinger import utils, config
 
 
 class TestSubprocessWrapper(object):
@@ -102,6 +105,44 @@ class TestGitClient(object):
         git.commit("Test Repo")
         assert b"Test Repo" in subprocess.check_output(["git", "log"])
 
+    def test_files_with_gitignore(self, git):
+        config = {"user.name": "Test User", "user.email": "test@example.com"}
+        with open("one.txt", "w") as one:
+            one.write("one")
+        with open("two.txt", "w") as two:
+            two.write("two")
+        with open(".gitignore", "w") as ignore:
+            ignore.write("two.*")
+        git.init(config=config)
+
+        assert set(git.files()) == {".gitignore", "one.txt"}
+
+    def test_both_commited_and_uncommitted_files_shown(self, git):
+        config = {"user.name": "Test User", "user.email": "test@example.com"}
+        git.init(config=config)
+
+        with open("one.txt", "w") as one:
+            one.write("one")
+        git.add("--all")
+
+        with open("two.txt", "w") as two:
+            two.write("two")
+
+        assert git.files() == {"one.txt", "two.txt"}
+
+    def test_files_handles_nonascii_filenames(self, git):
+        config = {"user.name": "Test User", "user.email": "test@example.com"}
+        git.init(config=config)
+        filename = b"J\xc3\xb8hn D\xc3\xb8\xc3\xa9's \xe2\x80\x93.txt"
+
+        with open(filename, "w") as two:
+            two.write("blah")
+
+        assert git.files() == {filename.decode(locale.getpreferredencoding())}
+
+    def test_files_on_non_git_repo(self, git):
+        assert git.files() == set()
+
     def test_includes_details_in_exceptions(self, git):
         with pytest.raises(Exception) as ex_info:
             git.push("foo", "bar")
@@ -167,3 +208,88 @@ class TestParticipationTime(object):
         timeline = subject(a.participant(), reference_time, stub_config)
 
         assert not timeline.is_overdue
+
+
+class TestBaseURL(object):
+    @pytest.fixture
+    def subject(self):
+        from dallinger.utils import get_base_url
+
+        return get_base_url
+
+    @pytest.fixture
+    def config(self):
+        instance = config.get_config()
+        instance.ready = True
+        yield instance
+        config.config = None
+
+    def test_base_url_uses_environment(self, subject, config):
+        config.set("host", u"127.0.0.1")
+        config.set("base_port", 5000)
+        config.set("num_dynos_web", 1)
+        assert subject() == u"http://127.0.0.1:5000"
+
+    def test_local_base_url_converts(self, subject, config):
+        config.set("host", u"0.0.0.0")
+        config.set("base_port", 5000)
+        config.set("num_dynos_web", 1)
+        assert subject() == u"http://localhost:5000"
+
+    def test_remote_base_url_always_ssl(self, subject, config):
+        config.set("host", u"http://dlgr-bogus.herokuapp.com")
+        config.set("base_port", 80)
+        config.set("num_dynos_web", 1)
+        assert subject() == u"https://dlgr-bogus.herokuapp.com"
+
+    @pytest.mark.xfail(
+        reason="HOST aliasing removed to fix https://github.com/Dallinger/Dallinger/issues/2130"
+    )
+    def test_os_HOST_environ_used_as_host(self, subject, config):
+        with mock.patch("os.environ", {"HOST": u"dlgr-bogus-2.herokuapp.com"}):
+            config.load_from_environment()
+        config.set("base_port", 80)
+        config.set("num_dynos_web", 1)
+        assert subject() == u"https://dlgr-bogus-2.herokuapp.com"
+
+
+class TestIsolatedWebbrowser(object):
+    def test_chrome_isolation(self):
+        import webbrowser
+
+        with mock.patch("dallinger.utils.is_command") as is_command:
+            is_command.side_effect = lambda s: s == "google-chrome"
+            isolated = utils._new_webbrowser_profile()
+        assert isinstance(isolated, webbrowser.Chrome)
+        assert isolated.remote_args[:2] == [r"%action", r"%s"]
+        assert isolated.remote_args[-2].startswith(
+            '--user-data-dir="{}'.format(tempfile.gettempdir())
+        )
+        assert isolated.remote_args[-1] == r"--no-first-run"
+
+    def test_firefox_isolation(self):
+        import webbrowser
+
+        with mock.patch("dallinger.utils.is_command") as is_command:
+            is_command.side_effect = lambda s: s == "firefox"
+            isolated = utils._new_webbrowser_profile()
+        assert isinstance(isolated, webbrowser.Mozilla)
+        assert isolated.remote_args[0] == "-profile"
+        assert isolated.remote_args[1].startswith(tempfile.gettempdir())
+        assert isolated.remote_args[2:] == [
+            "-new-instance",
+            "-no-remote",
+            "-url",
+            r"%s",
+        ]
+
+    def test_fallback_isolation(self):
+        import webbrowser
+
+        with mock.patch.multiple(
+            "dallinger.utils", is_command=mock.DEFAULT, sys=mock.DEFAULT
+        ) as patches:
+            patches["is_command"].return_value = False
+            patches["sys"].platform = 'anything but "darwin"'
+            isolated = utils._new_webbrowser_profile()
+        assert isolated == webbrowser

@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+from __future__ import unicode_literals
 import mock
 import os
 import pexpect
@@ -7,10 +8,10 @@ import pytest
 import six
 import sys
 import tempfile
+import uuid
 from pytest import raises
 from six.moves import configparser
 
-from dallinger.deployment import new_webbrowser_profile
 from dallinger.config import get_config
 from dallinger import recruiters
 
@@ -28,21 +29,23 @@ def output():
 
 @pytest.fixture
 def browser():
-    import webbrowser
-
-    mock_browser = mock.Mock(spec=webbrowser)
-    with mock.patch("dallinger.deployment.new_webbrowser_profile") as get_browser:
-        get_browser.return_value = mock_browser
-        yield mock_browser
+    with mock.patch("dallinger.deployment.open_browser") as open_browser:
+        yield open_browser
 
 
 @pytest.fixture
-def faster(tempdir):
+def faster(tempdir, active_config):
     with mock.patch.multiple(
         "dallinger.deployment", time=mock.DEFAULT, setup_experiment=mock.DEFAULT
     ) as mocks:
         mocks["setup_experiment"].return_value = ("fake-uid", tempdir)
-
+        # setup_experiment normally sets the dashboard credentials if unset
+        active_config.extend(
+            {
+                "dashboard_user": six.text_type("admin"),
+                "dashboard_password": six.text_type("DUMBPASSWORD"),
+            }
+        )
         yield mocks
 
 
@@ -62,8 +65,8 @@ def fake_git():
 @pytest.fixture
 def fake_redis():
     mock_connection = mock.Mock(name="fake redis connection")
-    with mock.patch("dallinger.deployment.redis") as redis_module:
-        redis_module.from_url.return_value = mock_connection
+    with mock.patch("dallinger.deployment.connect_to_redis") as connect:
+        connect.return_value = mock_connection
         yield mock_connection
 
 
@@ -87,100 +90,212 @@ def heroku_mock():
 
     instance = mock.Mock(spec=HerokuApp)
     instance.redis_url = "\n"
-    instance.name = u"dlgr-fake-uid"
-    instance.url = u"fake-web-url"
-    instance.db_url = u"fake-db-url"
+    instance.name = "dlgr-fake-uid"
+    instance.url = "fake-web-url"
+    instance.db_url = "fake-db-url"
+    instance.addon_parameters.return_value = {}
     with mock.patch("dallinger.deployment.heroku") as heroku_module:
-        heroku_module.auth_token.return_value = u"fake token"
+        heroku_module.auth_token.return_value = "fake token"
         with mock.patch("dallinger.deployment.HerokuApp") as mock_app_class:
             mock_app_class.return_value = instance
             yield instance
 
 
-class TestIsolatedWebbrowser(object):
-    def test_chrome_isolation(self):
-        import webbrowser
-
-        with mock.patch("dallinger.deployment.is_command") as is_command:
-            is_command.side_effect = lambda s: s == "google-chrome"
-            isolated = new_webbrowser_profile()
-        assert isinstance(isolated, webbrowser.Chrome)
-        assert isolated.remote_args[:2] == [r"%action", r"%s"]
-        assert isolated.remote_args[-2].startswith(
-            '--user-data-dir="{}'.format(tempfile.gettempdir())
-        )
-        assert isolated.remote_args[-1] == r"--no-first-run"
-
-    def test_firefox_isolation(self):
-        import webbrowser
-
-        with mock.patch("dallinger.deployment.is_command") as is_command:
-            is_command.side_effect = lambda s: s == "firefox"
-            isolated = new_webbrowser_profile()
-        assert isinstance(isolated, webbrowser.Mozilla)
-        assert isolated.remote_args[0] == "-profile"
-        assert isolated.remote_args[1].startswith(tempfile.gettempdir())
-        assert isolated.remote_args[2:] == [
-            "-new-instance",
-            "-no-remote",
-            "-url",
-            r"%s",
-        ]
-
-    def test_fallback_isolation(self):
-        import webbrowser
-
-        with mock.patch.multiple(
-            "dallinger.deployment", is_command=mock.DEFAULT, sys=mock.DEFAULT
-        ) as patches:
-            patches["is_command"].return_value = False
-            patches["sys"].platform = 'anything but "darwin"'
-            isolated = new_webbrowser_profile()
-        assert isolated == webbrowser
-
-
 @pytest.mark.usefixtures("in_tempdir")
-class TestExperimentDirectorySizeCheck(object):
+class TestExperimentFilesSource(object):
     @pytest.fixture
-    def size_check(self):
-        from dallinger.deployment import size_on_copy
+    def git(self):
+        from dallinger.utils import GitClient
 
-        return size_on_copy
+        return GitClient()
 
-    def test_includes_files_that_would_be_copied(self, size_check):
-        with open("legit.txt", "w") as f:
+    @pytest.fixture
+    def subject(self):
+        from dallinger.deployment import ExperimentFileSource
+
+        return ExperimentFileSource
+
+    def test_lists_files_valid_for_copying(self, subject):
+        legit_file = "./some/subdir/John Doe's file.txt"
+        os.makedirs(os.path.dirname(legit_file))
+        with open(legit_file, "w") as f:
             f.write("12345")
 
-        assert size_check(".") == 5
+        source = subject()
 
-    def test_excludes_files_that_would_not_be_copied(self, size_check):
+        assert legit_file in source.files
+
+    def test_excludes_files_that_should_not_be_copied(self, subject):
         with open("illegit.db", "w") as f:
             f.write("12345")
 
-        assert size_check(".") == 0
+        source = subject()
 
-    def test_excludes_directories_that_would_not_be_copied(self, size_check):
+        assert len(source.files) == 0
+
+    def test_excludes_otherwise_valid_files_if_in_gitignore_simple(self, subject, git):
+        legit_file = "./some/subdir/legit.txt"
+        os.makedirs(os.path.dirname(legit_file))
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        with open(".gitignore", "w") as f:
+            f.write("*.txt")
+        git.init()
+
+        source = subject()
+
+        assert source.files == {"./.gitignore"}
+
+    def test_excludes_otherwise_valid_files_if_in_gitignore_complex(self, subject, git):
+        legit_file = "./some/subdir/legit.txt"
+        os.makedirs(os.path.dirname(legit_file))
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        with open(".gitignore", "w") as f:
+            f.write("**/subdir/*")
+        git.init()
+
+        source = subject()
+
+        assert source.files == {"./.gitignore"}
+
+    def test_normalizes_unicode_for_merging_git_inclusions(self, subject, git):
+        legit_file = "".join(
+            [".", "/", "a", "̊", " ", "f", "i", "l", "e", ".", "t", "x", "t"]
+        )
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        git.init()
+
+        source = subject()
+
+        assert source.files == {legit_file}
+
+    def test_size_includes_files_that_would_be_copied(self, subject):
+        with open("legit.txt", "w") as f:
+            f.write("12345")
+
+        source = subject()
+
+        assert source.size == 5
+
+    def test_size_excludes_files_that_would_not_be_copied(self, subject):
+        with open("illegit.db", "w") as f:
+            f.write("12345")
+
+        source = subject()
+
+        assert source.size == 0
+
+    def test_size_excludes_directories_that_would_not_be_copied(self, subject):
         os.mkdir("snapshots")
         with open("snapshots/legit.txt", "w") as f:
             f.write("12345")
 
-        assert size_check(".") == 0
+        source = subject()
 
-    def test_excludes_bad_files_when_in_subdirectories(self, size_check):
+        assert source.size == 0
+
+    def test_size_excludes_bad_files_when_in_subdirectories(self, subject):
         os.mkdir("legit_dir")
         with open("legit_dir/illegit.db", "w") as f:
             f.write("12345")
 
-        assert size_check(".") == 0
+        source = subject()
+
+        assert source.size == 0
+
+    def test_copy_to_copies_to_same_subdirectories(self, subject):
+        legit_file = "./some/subdir/John Doe's file.txt"
+        os.makedirs(os.path.dirname(legit_file))
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        destination = tempfile.mkdtemp()
+        source = subject()
+
+        source.selective_copy_to(destination)
+
+        assert os.path.isfile(
+            os.path.join(destination, "some/subdir/John Doe's file.txt")
+        )
+
+    def test_copy_to_copies_with_explicit_root(self, subject):
+        legit_file = "./some/subdir/legit.txt"
+        os.makedirs(os.path.dirname(legit_file))
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        destination = tempfile.mkdtemp()
+        source = subject(os.getcwd())
+
+        source.selective_copy_to(destination)
+
+        assert os.path.isfile(os.path.join(destination, "some/subdir/legit.txt"))
+
+    def test_copy_to_copies_nonascii_filenames(self, subject):
+        legit_file = "".join(["a", "̊", " ", "f", "i", "l", "e"])
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        destination = tempfile.mkdtemp()
+        source = subject()
+
+        source.selective_copy_to(destination)
+
+        assert os.path.isfile(os.path.join(destination, legit_file))
+
+    def test_copy_to_copies_nonascii_filenames2(self, subject):
+        legit_file = "".join(["å", " ", "f", "i", "l", "e"])
+        with open(legit_file, "w") as f:
+            f.write("12345")
+        destination = tempfile.mkdtemp()
+        source = subject()
+
+        source.selective_copy_to(destination)
+
+        assert os.path.isfile(os.path.join(destination, legit_file))
 
 
 @pytest.mark.usefixtures("bartlett_dir", "active_config", "reset_sys_modules")
 class TestSetupExperiment(object):
     @pytest.fixture
-    def setup_experiment(self):
+    def setup_experiment(self, env):
         from dallinger.deployment import setup_experiment as subject
 
         return subject
+
+    def test_generates_exp_and_app_uid_if_none_provided(self, setup_experiment):
+        exp_id, dst = setup_experiment(log=mock.Mock())
+
+        assert isinstance(uuid.UUID(exp_id, version=4), uuid.UUID)
+
+    def test_generated_uid_saved_to_config(self, active_config, setup_experiment):
+        exp_id, dst = setup_experiment(log=mock.Mock())
+
+        assert active_config.get("id") == exp_id
+
+    def test_uses_provided_app_uid(self, setup_experiment):
+        exp_id, dst = setup_experiment(log=mock.Mock(), app="my-custom-app-id")
+
+        assert exp_id == "my-custom-app-id"
+
+    def test_saves_provided_app_uid_to_config(self, active_config, setup_experiment):
+        exp_id, dst = setup_experiment(log=mock.Mock(), app="my-custom-app-id")
+
+        assert "my-custom-app-id" == active_config.get("heroku_app_id_root")
+
+    def test_still_saves_uuid_in_addition_to_custom_app_id(
+        self, active_config, setup_experiment
+    ):
+        exp_id, dst = setup_experiment(log=mock.Mock(), app="my-custom-app-id")
+
+        assert isinstance(uuid.UUID(active_config.get("id"), version=4), uuid.UUID)
+
+    def test_dashboard_credentials_saved_to_config(
+        self, active_config, setup_experiment
+    ):
+        exp_id, dst = setup_experiment(log=mock.Mock())
+
+        assert active_config.get("dashboard_user") == six.text_type("admin")
+        assert active_config.get("dashboard_password") == mock.ANY
 
     def test_setup_creates_new_experiment(self, setup_experiment):
         # Baseline
@@ -188,6 +303,7 @@ class TestSetupExperiment(object):
         assert found_in("experiment.py", exp_dir)
         assert not found_in("experiment_id.txt", exp_dir)
         assert not found_in("Procfile", exp_dir)
+        assert not found_in("runtime.txt", exp_dir)
 
         exp_id, dst = setup_experiment(log=mock.Mock())
 
@@ -199,6 +315,7 @@ class TestSetupExperiment(object):
         assert found_in("experiment.py", dst)
         assert found_in("models.py", dst)
         assert found_in("Procfile", dst)
+        assert found_in("runtime.txt", dst)
 
         assert found_in(os.path.join("static", "css", "dallinger.css"), dst)
         assert found_in(os.path.join("static", "scripts", "dallinger2.js"), dst)
@@ -214,6 +331,16 @@ class TestSetupExperiment(object):
         assert found_in(os.path.join("templates", "launch.html"), dst)
         assert found_in(os.path.join("templates", "complete.html"), dst)
 
+    def test_setup_uses_specified_python_version(self, active_config, setup_experiment):
+        active_config.extend({"heroku_python_version": "2.7.14"})
+
+        exp_id, dst = setup_experiment(log=mock.Mock())
+
+        with open(os.path.join(dst, "runtime.txt"), "r") as file:
+            version = file.read()
+
+        assert version == "python-2.7.14"
+
     def test_setup_procfile_no_clock(self, setup_experiment):
         config = get_config()
         config.set("clock_on", False)
@@ -225,7 +352,7 @@ class TestSetupExperiment(object):
 
         assert found_in("Procfile", dst)
         with open(os.path.join(dst, "Procfile")) as proc:
-            assert "clock: dallinger_heroku_clock" not in [l.strip() for l in proc]
+            assert "clock: dallinger_heroku_clock" not in [p.strip() for p in proc]
 
     def test_setup_procfile_with_clock(self, setup_experiment):
         config = get_config()
@@ -238,7 +365,7 @@ class TestSetupExperiment(object):
 
         assert found_in("Procfile", dst)
         with open(os.path.join(dst, "Procfile")) as proc:
-            assert "clock: dallinger_heroku_clock" in [l.strip() for l in proc]
+            assert "clock: dallinger_heroku_clock" in [p.strip() for p in proc]
 
     def test_setup_with_custom_dict_config(self, setup_experiment):
         config = get_config()
@@ -267,9 +394,9 @@ class TestSetupExperiment(object):
 
         config.extend(
             {
-                "a_password": u"secret thing",
-                "something_sensitive": u"hide this",
-                "something_normal": u"show this",
+                "a_password": "secret thing",
+                "something_sensitive": "hide this",
+                "something_normal": "show this",
             }
         )
 
@@ -294,6 +421,90 @@ class TestSetupExperiment(object):
                 assert ex_info.match("Boom!")
 
 
+@pytest.mark.usefixtures("experiment_dir", "active_config", "reset_sys_modules")
+class TestSetupExperimentAdditional(object):
+    @pytest.fixture
+    def setup_experiment(self):
+        from dallinger.deployment import setup_experiment as subject
+
+        return subject
+
+    def test_additional_files_can_be_included_by_module_function(
+        self, setup_experiment
+    ):
+        # Baseline
+        exp_dir = os.getcwd()
+        assert found_in("dallinger_experiment.py", exp_dir)
+        assert not found_in("experiment_id.txt", exp_dir)
+        assert not found_in("Procfile", exp_dir)
+        assert not found_in("runtime.txt", exp_dir)
+
+        exp_id, dst = setup_experiment(log=mock.Mock())
+
+        # dst should be a temp dir with a cloned experiment for deployment
+        assert exp_dir != dst
+        assert "/tmp" in dst
+
+        assert found_in("experiment_id.txt", dst)
+        assert found_in("dallinger_experiment.py", dst)
+
+        # Files specified individually are copied
+        assert found_in(os.path.join("static", "expfile.txt"), dst)
+        # As are ones specified as part of a directory
+        assert found_in(os.path.join("static", "copied_templates", "ad.html"), dst)
+
+    def test_warning_if_multiple_experiments_found(
+        self, active_config, setup_experiment
+    ):
+        with mock.patch("warnings.warn") as warn:
+            _, _ = setup_experiment(log=mock.Mock())
+
+        assert len(warn.mock_calls) == 1
+        e = warn.mock_calls[0][1][0]
+        assert "EXPERIMENT_CLASS_NAME" in str(e)
+        assert (
+            "Picking TestExperiment from ['TestExperiment', 'ZSubclassThatSortsLower']"
+            in str(e)
+        )
+
+        # No warning raised if we set the variable
+        try:
+            os.environ["EXPERIMENT_CLASS_NAME"] = "ZSubclassThatSortsLower"
+            with mock.patch("warnings.warn") as warn:
+                exp_id, dst = setup_experiment(log=mock.Mock())
+            assert len(warn.mock_calls) == 0
+        finally:
+            del os.environ["EXPERIMENT_CLASS_NAME"]
+
+    def test_additional_files_can_be_included_by_exp_classmethod(
+        self, active_config, setup_experiment
+    ):
+        # Baseline
+        exp_dir = os.getcwd()
+        assert found_in("dallinger_experiment.py", exp_dir)
+        assert not found_in("experiment_id.txt", exp_dir)
+        assert not found_in("Procfile", exp_dir)
+        assert not found_in("runtime.txt", exp_dir)
+
+        try:
+            os.environ["EXPERIMENT_CLASS_NAME"] = "ZSubclassThatSortsLower"
+            exp_id, dst = setup_experiment(log=mock.Mock())
+        finally:
+            del os.environ["EXPERIMENT_CLASS_NAME"]
+
+        # dst should be a temp dir with a cloned experiment for deployment
+        assert exp_dir != dst
+        assert "/tmp" in dst
+
+        assert found_in("experiment_id.txt", dst)
+        assert found_in("dallinger_experiment.py", dst)
+
+        # Files specified individually are copied
+        assert found_in(os.path.join("static", "different.txt"), dst)
+        # As are ones specified as part of a directory
+        assert found_in(os.path.join("static", "different", "ad.html"), dst)
+
+
 @pytest.mark.usefixtures("active_config", "launch", "fake_git", "fake_redis", "faster")
 class TestDeploySandboxSharedSetupNoExternalCalls(object):
     @pytest.fixture
@@ -306,8 +517,9 @@ class TestDeploySandboxSharedSetupNoExternalCalls(object):
         log = mock.Mock()
         result = dsss(log=log)
         assert result == {
-            "app_home": u"fake-web-url",
-            "app_name": u"dlgr-fake-uid",
+            "app_home": "fake-web-url",
+            "app_name": "dlgr-fake-uid",
+            "dashboard_url": "fake-web-url/dashboard/",
             "recruitment_msg": "fake\nrecruitment\nlist",
         }
 
@@ -336,11 +548,12 @@ class TestDeploySandboxSharedSetupNoExternalCalls(object):
         dsss(log=mock.Mock())
         heroku_mock.set_multiple.assert_called_once_with(
             auto_recruit=True,
-            aws_access_key_id=u"fake aws key",
-            aws_region=u"us-east-1",
-            aws_secret_access_key=u"fake aws secret",
-            smtp_password=u"fake email password",
-            smtp_username=u"fake email username",
+            aws_access_key_id="fake aws key",
+            aws_region="us-east-1",
+            aws_secret_access_key="fake aws secret",
+            FLASK_SECRET_KEY=mock.ANY,  # password is random
+            smtp_password="fake email password",
+            smtp_username="fake email username",
             whimsical=True,
         )
 
@@ -357,10 +570,19 @@ class TestDeploySandboxSharedSetupNoExternalCalls(object):
         dsss(log=mock.Mock())
         heroku_mock.scale_up_dyno.assert_has_calls(
             [
-                mock.call("web", 1, u"free"),
-                mock.call("worker", 1, u"free"),
-                mock.call("clock", 1, u"free"),
+                mock.call("web", 1, "free"),
+                mock.call("worker", 1, "free"),
+                mock.call("clock", 1, "free"),
             ]
+        )
+
+    def test_scales_different_dynos(self, dsss, heroku_mock, active_config):
+        active_config.set("dyno_type", "ignored")
+        active_config.set("dyno_type_web", "tiny")
+        active_config.set("dyno_type_worker", "massive")
+        dsss(log=mock.Mock())
+        heroku_mock.scale_up_dyno.assert_has_calls(
+            [mock.call("web", 1, "tiny"), mock.call("worker", 1, "massive")]
         )
 
     def test_calls_launch(self, dsss, heroku_mock, launch):
@@ -375,6 +597,13 @@ class TestDeploySandboxSharedSetupNoExternalCalls(object):
         from dallinger.deployment import heroku
 
         heroku.sanity_check.assert_called_once_with(active_config)
+
+    def test_runs_prelaunch_actions(self, dsss, heroku_mock, active_config):
+        log = mock.Mock()
+        action = mock.Mock()
+        dsss(log=log, prelaunch_actions=[action])
+
+        action.assert_called_once_with(heroku_mock, active_config)
 
 
 @pytest.mark.skipif(
@@ -397,31 +626,6 @@ class TestDeploySandboxSharedSetupFullSystem(object):
         assert app_name.startswith("dlgr")
 
 
-@pytest.mark.usefixtures("active_config")
-class Test_deploy_in_mode(object):
-    @pytest.fixture
-    def dim(self):
-        from dallinger.deployment import _deploy_in_mode
-
-        return _deploy_in_mode
-
-    @pytest.fixture
-    def dsss(self):
-        with mock.patch(
-            "dallinger.deployment.deploy_sandbox_shared_setup"
-        ) as mock_dsss:
-            yield mock_dsss
-
-    def test_sets_mode_in_config(self, active_config, dim, dsss):
-        dim(u"live", "some app id", verbose=True, log=mock.Mock())
-        dsss.assert_called_once()
-        assert active_config.get("mode") == u"live"
-
-    def test_sets_logfile_to_dash_for_some_reason(self, active_config, dim, dsss):
-        dim(u"live", "some app id", verbose=True, log=mock.Mock())
-        assert active_config.get("logfile") == u"-"
-
-
 @pytest.mark.usefixtures("bartlett_dir")
 @pytest.mark.slow
 class Test_handle_launch_data(object):
@@ -435,10 +639,10 @@ class Test_handle_launch_data(object):
         log = mock.Mock()
         with mock.patch("dallinger.deployment.requests.post") as mock_post:
             result = mock.Mock(
-                ok=True, json=mock.Mock(return_value={"message": u"msg!"})
+                ok=True, json=mock.Mock(return_value={"message": "msg!"})
             )
             mock_post.return_value = result
-            assert handler("/some-launch-url", error=log) == {"message": u"msg!"}
+            assert handler("/some-launch-url", error=log) == {"message": "msg!"}
 
     def test_failure(self, handler):
         from requests.exceptions import HTTPError
@@ -447,22 +651,27 @@ class Test_handle_launch_data(object):
         with mock.patch("dallinger.deployment.requests.post") as mock_post:
             mock_post.return_value = mock.Mock(
                 ok=False,
-                json=mock.Mock(return_value={"message": u"msg!"}),
+                json=mock.Mock(return_value={"message": "msg!"}),
                 raise_for_status=mock.Mock(side_effect=HTTPError),
+                status_code=500,
+                text="Failure",
             )
             with pytest.raises(HTTPError):
                 handler("/some-launch-url", error=log, delay=0.05, attempts=3)
 
         log.assert_has_calls(
             [
+                mock.call("Error accessing /some-launch-url (500):\nFailure"),
                 mock.call(
                     "Experiment launch failed. Trying again (attempt 2 of 3) in 0.1 seconds ..."
                 ),
+                mock.call("Error accessing /some-launch-url (500):\nFailure"),
                 mock.call(
                     "Experiment launch failed. Trying again (attempt 3 of 3) in 0.2 seconds ..."
                 ),
+                mock.call("Error accessing /some-launch-url (500):\nFailure"),
                 mock.call("Experiment launch failed, check web dyno logs for details."),
-                mock.call(u"msg!"),
+                mock.call("msg!"),
             ]
         )
 
@@ -476,7 +685,7 @@ class Test_handle_launch_data(object):
                 handler("/some-launch-url", error=log)
 
         log.assert_called_once_with(
-            "Error parsing response from /launch, check web dyno logs for details: "
+            "Error parsing response from /some-launch-url, check web dyno logs for details: "
             "Big, unexpected problem."
         )
 
@@ -496,6 +705,22 @@ class TestDebugServer(object):
             debugger.status_thread.join()
 
     @pytest.fixture
+    def no_browser_debugger(self, output):
+        from dallinger.deployment import DebugDeployment
+
+        debugger = DebugDeployment(
+            output,
+            verbose=True,
+            bot=False,
+            proxy_port=None,
+            exp_config={},
+            no_browsers=True,
+        )
+        yield debugger
+        if debugger.status_thread:
+            debugger.status_thread.join()
+
+    @pytest.fixture
     def debugger(self, debugger_unpatched):
         from dallinger.heroku.tools import HerokuLocalWrapper
 
@@ -504,6 +729,7 @@ class TestDebugServer(object):
         return debugger
 
     def test_startup(self, debugger):
+        debugger.no_browsers = True
         debugger.run()
         "Server is running" in str(debugger.out.log.call_args_list[0])
 
@@ -518,19 +744,13 @@ class TestDebugServer(object):
                 debugger.run()
 
     def test_new_participant(self, debugger_unpatched):
-        from dallinger.config import get_config
-
         debugger = debugger_unpatched
-        get_config().load()
         debugger.new_recruit = mock.Mock(return_value=None)
         assert not debugger.new_recruit.called
         debugger.notify(" New participant requested: http://example.com")
         assert debugger.new_recruit.called
 
     def test_recruitment_closed(self, debugger_unpatched):
-        from dallinger.config import get_config
-
-        get_config().load()
         debugger = debugger_unpatched
         debugger.new_recruit = mock.Mock(return_value=None)
         debugger.heroku = mock.Mock()
@@ -548,7 +768,13 @@ class TestDebugServer(object):
             " {} some-fake-url".format(recruiters.NEW_RECRUIT_LOG_PREFIX)
         )
 
-        browser.open.assert_called_once_with("some-fake-url", autoraise=True, new=1)
+        browser.assert_called_once_with("some-fake-url")
+
+    def test_new_recruit_no_browser(self, no_browser_debugger, browser):
+        no_browser_debugger.notify(
+            " {} some-fake-url".format(recruiters.NEW_RECRUIT_LOG_PREFIX)
+        )
+        browser.assert_not_called()
 
     def test_new_recruit_opens_browser_on_proxy_port(
         self, active_config, debugger_unpatched, browser
@@ -559,16 +785,14 @@ class TestDebugServer(object):
                 recruiters.NEW_RECRUIT_LOG_PREFIX, active_config.get("base_port")
             )
         )
-        browser.open.assert_called_once_with(
-            "some-fake-url:2222", autoraise=True, new=1
-        )
+        browser.assert_called_once_with("some-fake-url:2222")
 
     def test_new_recruit_not_triggered_if_quoted(self, debugger_unpatched, browser):
         debugger_unpatched.notify(
             ' "{}" some-fake-url'.format(recruiters.NEW_RECRUIT_LOG_PREFIX)
         )
 
-        browser.open.assert_not_called()
+        browser.assert_not_called()
 
     @pytest.mark.skipif(
         not pytest.config.getvalue("runbot"), reason="--runbot was specified"
@@ -590,6 +814,31 @@ class TestDebugServer(object):
                 p.read()
             except IOError:
                 pass
+
+    def test_failure(self, debugger):
+        from requests.exceptions import HTTPError
+
+        with mock.patch("dallinger.deployment.HerokuLocalWrapper"):
+            with mock.patch("dallinger.deployment.requests.post") as mock_post:
+                mock_post.return_value = mock.Mock(
+                    ok=False,
+                    json=mock.Mock(return_value={"message": "msg!"}),
+                    raise_for_status=mock.Mock(side_effect=HTTPError),
+                    status_code=500,
+                    text="Failure",
+                )
+                debugger.run()
+
+        # Only one launch attempt should be made in debug mode
+        debugger.out.error.assert_has_calls(
+            [
+                mock.call(
+                    "Error accessing http://localhost:5000/launch (500):\nFailure"
+                ),
+                mock.call("Experiment launch failed, check web dyno logs for details."),
+                mock.call("msg!"),
+            ]
+        )
 
 
 @pytest.mark.usefixtures("bartlett_dir", "clear_workers", "env")
@@ -643,10 +892,10 @@ class TestLoad(object):
 
         loader.out.log.assert_has_calls(
             [
-                mock.call("Starting up the server..."),
+                mock.call("Starting up the Heroku Local server..."),
                 mock.call("Ingesting dataset from some_experiment_id-data.zip..."),
                 mock.call(
-                    "Server is running on http://0.0.0.0:{}. Press Ctrl+C to exit.".format(
+                    "Server is running on http://localhost:{}. Press Ctrl+C to exit.".format(
                         os.environ.get("base_port", 5000)
                     )
                 ),
@@ -667,10 +916,10 @@ class TestLoad(object):
 
         replay_loader.out.log.assert_has_calls(
             [
-                mock.call("Starting up the server..."),
+                mock.call("Starting up the Heroku Local server..."),
                 mock.call("Ingesting dataset from some_experiment_id-data.zip..."),
                 mock.call(
-                    "Server is running on http://0.0.0.0:{}. Press Ctrl+C to exit.".format(
+                    "Server is running on http://localhost:{}. Press Ctrl+C to exit.".format(
                         os.environ.get("base_port", 5000)
                     )
                 ),

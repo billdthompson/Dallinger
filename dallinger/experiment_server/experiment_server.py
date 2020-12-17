@@ -7,7 +7,16 @@ from json import loads
 import os
 import re
 
-from flask import abort, Flask, render_template, request, Response, send_from_directory
+from flask import (
+    abort,
+    Flask,
+    render_template,
+    request,
+    Response,
+    send_from_directory,
+    url_for,
+)
+from flask_login import LoginManager
 from jinja2 import TemplateNotFound
 from rq import Queue
 from sqlalchemy.orm.exc import NoResultFound, MultipleResultsFound
@@ -21,9 +30,10 @@ from dallinger import experiment
 from dallinger import models
 from dallinger.config import get_config
 from dallinger import recruiters
-from dallinger.notifications import get_messenger
+from dallinger.notifications import admin_notifier
 from dallinger.notifications import MessengerError
 
+from . import dashboard
 from .replay import ReplayBackend
 from .worker_events import worker_function
 from .utils import (
@@ -50,9 +60,15 @@ app = Flask("Experiment_Server")
 
 @app.before_first_request
 def _config():
+    app.secret_key = app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY")
     config = get_config()
     if not config.ready:
         config.load()
+    if config.get("dashboard_password", None):
+        app.config["ADMIN_USER"] = dashboard.User(
+            userid=config.get("dashboard_user", "admin"),
+            password=config.get("dashboard_password"),
+        )
 
     return config
 
@@ -75,19 +91,28 @@ else:
 # primary recruiter's route:
 app.register_blueprint(recruiters.mturk_routes)
 
+# Load dashboard routes and login setup
+app.register_blueprint(dashboard.dashboard)
+login = LoginManager(app)
+login.login_view = "dashboard.login"
+login.request_loader(dashboard.load_user_from_request)
+login.user_loader(dashboard.load_user)
+login.unauthorized_handler(dashboard.unauthorized)
+app.config["dashboard_tabs"] = dashboard.dashboard_tabs
+
 """Basic routes."""
 
 
 @app.route("/")
 def index():
     """Index route"""
-    config = _config()
-    html = "<html><head></head><body><h1>Dallinger Experiment in progress</h1><dl>"
-    for item in sorted(config.as_dict().items()):
-        html += '<dt style="font-weight:bold;margin-top:15px;">{}</dt><dd>{}</dd>'.format(
-            *item
+    html = (
+        "<html><head></head><body><h1>Dallinger Experiment in progress</h1>"
+        "<p><a href={}>Dashboard</a></p></body></html>".format(
+            url_for("dashboard.index")
         )
-    html += "</dl></body></html>"
+    )
+
     return html
 
 
@@ -247,9 +272,9 @@ def handle_error():
         ),
     }
     db.logger.debug("Reporting HIT error...")
-    messenger = get_messenger(config)
+    messenger = admin_notifier(config)
     try:
-        messenger.send(message)
+        messenger.send(**message)
     except MessengerError as ex:
         db.logger.exception(ex)
 
@@ -717,35 +742,28 @@ def create_participant(worker_id, hit_id, assignment_id, mode):
         + 1
     )
 
-    recruiter_name = request.args.get("recruiter", "undefined")
-    if not recruiter_name or recruiter_name == "undefined":
-        recruiter = recruiters.from_config(_config())
-        if recruiter:
-            recruiter_name = recruiter.nickname
+    recruiter_name = request.args.get("recruiter")
 
     # Create the new participant.
-    participant = models.Participant(
-        recruiter_id=recruiter_name,
-        worker_id=worker_id,
-        assignment_id=assignment_id,
-        hit_id=hit_id,
-        mode=mode,
-        fingerprint_hash=fingerprint_hash,
+    exp = Experiment(session)
+    participant = exp.create_participant(
+        worker_id, hit_id, assignment_id, mode, recruiter_name, fingerprint_hash
     )
 
-    exp = Experiment(session)
-
+    session.flush()
     overrecruited = exp.is_overrecruited(nonfailed_count)
     if overrecruited:
         participant.status = "overrecruited"
 
-    session.add(participant)
-    session.flush()  # Make sure we know the id for the new row
     result = {"participant": participant.__json__()}
 
     # Queue notification to others in waiting room
     if exp.quorum:
-        quorum = {"q": exp.quorum, "n": nonfailed_count, "overrecruited": overrecruited}
+        quorum = {
+            "q": exp.quorum,
+            "n": nonfailed_count,
+            "overrecruited": participant.status == "overrecruited",
+        }
         db.queue_message(WAITING_ROOM_CHANNEL, dumps(quorum))
         result["quorum"] = quorum
 
@@ -761,6 +779,27 @@ def get_participant(participant_id):
     except NoResultFound:
         return error_response(
             error_type="/participant GET: no participant found", status=403
+        )
+
+    # return the data
+    return success_response(participant=ppt.__json__())
+
+
+@app.route("/participant", methods=["POST"])
+def load_participant():
+    """Get the participant with an assignment id provided in the request.
+    Delegates to :func:`~dallinger.experiments.Experiment.load_participant`.
+    """
+    assignment_id = request_parameter("assignment_id", optional=True)
+    if assignment_id is None:
+        return error_response(
+            error_type="/participant POST: no participant found", status=403
+        )
+    exp = Experiment(session)
+    ppt = exp.load_participant(assignment_id)
+    if ppt is None:
+        return error_response(
+            error_type="/participant POST: no participant found", status=403
         )
 
     # return the data
@@ -813,6 +852,12 @@ def create_question(participant_id):
             ),
             participant=ppt,
         )
+
+    config = get_config()
+    question_max_length = config.get("question_max_length", 1000)
+
+    if len(question) > question_max_length or len(response) > question_max_length:
+        return error_response(error_type="/question POST length too long", status=400)
 
     try:
         # execute the request
@@ -1169,6 +1214,8 @@ def info_post(node_id):
     info_type = request_parameter(
         parameter="info_type", parameter_type="known_class", default=models.Info
     )
+    failed = request_parameter(parameter="failed", parameter_type="bool", default=False)
+
     for x in [contents, info_type]:
         if type(x) == Response:
             return x
@@ -1180,7 +1227,10 @@ def info_post(node_id):
     exp = Experiment(session)
     try:
         # execute the request
-        info = info_type(origin=node, contents=contents)
+        additional_params = {}
+        if failed:
+            additional_params["failed"] = failed
+        info = info_type(origin=node, contents=contents, **additional_params)
         assign_properties(info)
 
         # ping the experiment

@@ -1,10 +1,67 @@
 # Change Log
+## [v-master](https://github.com/dallinger/dallinger/tree/master) (xxxx-xx-xx)
 
-## [v-master](https://github.com/dallinger/dallinger/master) (xxxx-xx-xx)
+## [v-6.5.0](https://github.com/dallinger/dallinger/tree/6.5.0) (2020-09-09)
+- New `dallinger.loadParticipant` function to load participant data into the browser
+  based on an `assignmentId`
+- Performance improvement: `dallinger debug` now starts up in about half the time
+- Delegates participant creation to Experiment `create_participant` method and
+  `participant_constructor` attribute to allow experiments to specify custom
+  Participant classes.
+- Add extensible actions to the dashboard database view.
+- Disable global S3 experiment registration by default.
+- Provide a new `--archive` option to `dallinger deploy` and `dallinger sandbox` which makes it possible to start an experiment run with the database populated from an experiment archive created with `dallinger export`
 
-## [v-5.1.0](https://github.com/dallinger/dallinger/5.1.0) (2019-08-29)
 
-- At MTurk REST notifications are deprecated, the MTurk Recruiter creates an SNS Topic based on the experiment UID, subscribes to it, performs a subscription endpoint confirmation step, then associates the subscription with the HIT in order to receive notifications from MTurk about worker and HIT events
+## [v-6.4.0](https://github.com/dallinger/dallinger/tree/6.4.0) (2020-08-03)
+- Bugfix: Fixes for Dashboard monitor layout and color issues
+- New customizable database dashboard for viewing live experiment data
+- Fixes and enhancements to the Lifecycle and Heroku dashboards
+- Use localhost as hostname when running in debug mode by default.
+- Dashboard credentials can now be set using configuration parameters.
+
+## [v-6.3.1](https://github.com/dallinger/dallinger/tree/6.3.1) (2020-07-21)
+- Bugfix: Dashboard authentication now works with multiple web processes and dynos
+- Bugfix: Correct accidental change to Dallinger version used in Bartlett1932 demo
+- Update webdriver call to avoid deprecation warning
+
+## [v-6.3.0](https://github.com/dallinger/dallinger/tree/6.3.0) (2020-07-08)
+- Add `file:/path/to/file` support to configuration system.
+- Add validators to configuration system.
+- Add new `qualification_requirements` config parameter to add explicit MTurk
+  qualifications.
+- New, extensible `/dashboard` infrastructure for viewing and manipulating details of the live experiment, protected by a username and password (see http://docs.dallinger.io/en/latest/monitoring_a_live_experiment.html#the-dashboard)
+- New `dallinger extend_mtuk_hit` command: extend an existing MTurk HIT by adding assignments, and optionally, additional time before expiration.
+
+## [v-6.2.2](https://github.com/dallinger/dallinger/tree/6.2.2) (2020-04-27)
+- Bugfix: revert change to `HOST` configuration which broke Heroku deployments (see https://github.com/Dallinger/Dallinger/issues/2130)
+
+## [v-6.2.1](https://github.com/Dallinger/Dallinger/tree/v6.2.1) (2020-04-25)
+- New `dallinger compensate` command: compensate a worker a specific amount in US dollars. This is useful if something goes wrong with the experiment and you need to pay workers for their wasted time.
+- New `dallinger email_test` command: validate and test your email settings quickly and easily.
+- Much of Dallinger core's test infrastructure has been moved to a [`pytest` plugin](https://docs.pytest.org/en/latest/plugins.html) called `pytest_dallinger`, which incorporates various fixtures from the Dallinger tests that are useful for writing experiment tests and adds some new fixtures and utility functions for that purpose.
+
+## [v-6.1.0](https://github.com/Dallinger/Dallinger/tree/v6.2.0) (2020-04-10)
+- No longer retry `/launch` route in debug mode. Additional logging for launch retries.
+- Allow setting of separate optional `dyno_type_web` and `dyno_type_worker` parameters.
+- Regression fix: experiment files with apostrophes and non-ascii characters in file names are again supported
+- Documentation for including dependencies on private repositories
+
+## [v-6.0.0](https://github.com/Dallinger/Dallinger/tree/v6.0.0) (2020-03-24)
+
+- Allow control of which python version will be run on Heroku through a new configuration
+variable `heroku_python_version`. If not overriddent the default version of 3.6.10 will
+be used.
+- If files in the custom experiment directory are excluded by Git (by a local or global
+.gitignore file, $GIT_DIR/info/exclude, etc.), they will not be copied for use in deployment
+or ``dallinger debug`` runs. They will also be excluded from file size checks performed
+automatically during ``debug`` and deployment, and by ``dallinger verify``.
+- Add `failed` parameter to the add info route. This requires that all custom `Info` classes respect a `failed` keyword argument.
+- Fixed an issue preventing the use of multisect fields in questionnaires, so multiple selections from a multiselect HTML input will now be persisted into the database as an array.
+
+## [v-5.1.0](https://github.com/Dallinger/Dallinger/tree/v5.1.0) (2019-08-29)
+
+- As MTurk REST notifications are deprecated, the MTurk Recruiter creates an SNS Topic based on the experiment UID, subscribes to it, performs a subscription endpoint confirmation step, then associates the subscription with the HIT in order to receive notifications from MTurk about worker and HIT events
 - MTurk code for registering HITs for REST notification using deprecated/discontinued API removed
 - Dallinger `/notifications` endpoint removed, and replaced by a `/mturk-sns-listener` Flask Blueprint route associated with the MTurk Recruiter
 - Some utility functions moved out of `experiment_server.experiment_server` and into `experiment_server.utils` and `experiment_server.worker_events` to avoid circular dependencies and unwanted import side-effects
@@ -124,7 +181,7 @@
 
 - Simplify data export by generating CSV file from the remote database
 
-- Improve stability and reliability of Bot participants 
+- Improve stability and reliability of Bot participants
 
 - `store+json2.min.js` is now included in standard Dallinger JS "bundle"
 
@@ -249,11 +306,11 @@ launched via Heroku through the `sentry` flag.
 - **FEATURE** The `dallinger debug` command now supports the `num_dynos_web`
   configuration parameter, for better performance when under heavy usage.
 
-- **FEATURE** Dallinger experiments may now be packaged as normal Python 
+- **FEATURE** Dallinger experiments may now be packaged as normal Python
   distributions. An example is `dallinger.bartlett1932`.
 
 - **FEATURE** Experiments may now include implementations of computer-controlled
-  participants through the Bot framework. The documentation includes 
+  participants through the Bot framework. The documentation includes
   [instructions on running bots](http://docs.dallinger.io/en/latest/running_bots.html).
   The demos bartlett1932 and chatroom contain example bot implementations.
 
@@ -287,7 +344,7 @@ launched via Heroku through the `sentry` flag.
 - Command line tools now use a full UUID, rather than a short id starting with
   `dlgr-`
 
-- A bug in the chatroom demo was fixed which improves 
+- A bug in the chatroom demo was fixed which improves
   reliability and simplifies the connection to the backend. [\#537](https://github.com/Dallinger/Dallinger/issues/537)
 
 - The fitness parameter of `dallinger.nodes.Agent` is now a

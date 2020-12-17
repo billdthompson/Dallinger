@@ -83,6 +83,7 @@ designing new experiments for others to use.
     writing_bots
     extra_configuration
     recruitment
+    private_repo
 
 Core Contribution Documentation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -95,6 +96,7 @@ in order to develop new experiments. Follow the Developer Installation process f
     :maxdepth: 1
 
     running_the_tests
+    building_documentation
     contributing_to_dallinger
 
 General Information

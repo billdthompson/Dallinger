@@ -5,6 +5,7 @@ from __future__ import unicode_literals
 
 from cached_property import cached_property
 from collections import Counter
+from collections import OrderedDict
 from contextlib import contextmanager
 from functools import wraps
 import datetime
@@ -18,11 +19,14 @@ import requests
 import sys
 import time
 import uuid
+import warnings
 
 from sqlalchemy import and_
 from sqlalchemy import create_engine
+from sqlalchemy import distinct
 from sqlalchemy import func
 from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.orm.exc import NoResultFound, MultipleResultsFound
 
 from dallinger import recruiters
 from dallinger.config import get_config, LOCAL_CONFIG
@@ -34,12 +38,14 @@ from dallinger.data import load as data_load
 from dallinger.data import find_experiment_export
 from dallinger.data import ingest_zip
 from dallinger.db import init_db, db_url
-from dallinger.models import Network, Node, Info, Transformation, Participant
+from dallinger import models
+from dallinger.models import Network, Node, Info, Transformation, Participant, Vector
 from dallinger.heroku.tools import HerokuApp
 from dallinger.information import Gene, Meme, State
 from dallinger.nodes import Agent, Source, Environment
 from dallinger.transformations import Compression, Response
 from dallinger.transformations import Mutation, Replication
+from dallinger.utils import struct_to_html
 
 
 from dallinger.networks import Empty
@@ -76,6 +82,11 @@ class Experiment(object):
     channel = None
     exp_config = None
     replay_path = "/"
+
+    #: Constructor for Participant objects. Callable returning an instance of
+    #: :attr:`~dallinger.models.Participant` or a sub-class. Used by
+    #: :func:`~dallinger.experiment.Experiment.create_participant`.
+    participant_constructor = Participant
 
     def __init__(self, session=None):
         """Create the experiment class. Sets the default value of attributes."""
@@ -297,6 +308,62 @@ class Experiment(object):
 
         """
         network.add_node(node)
+
+    def create_participant(
+        self,
+        worker_id,
+        hit_id,
+        assignment_id,
+        mode,
+        recruiter_name=None,
+        fingerprint_hash=None,
+    ):
+        """Creates and returns a new participant object. Uses
+        :attr:`~dallinger.experiment.Experiment.participant_constructor` as the
+        constructor.
+
+        :param worker_id: the recruiter Worker Id
+        :type worker_id: str
+        :param hit_id: the recruiter HIT Id
+        :type hit_id: str
+        :param assignment_id: the recruiter Assignment Id
+        :type assignment_id: str
+        :param mode: the application mode
+        :type mode: str
+        :param recruiter_name: the recruiter name
+        :type recruiter_name: str
+        :returns: A :attr:`~dallinger.models.Participant` instance
+        """
+        if not recruiter_name:
+            recruiter = self.recruiter
+            if recruiter:
+                recruiter_name = recruiter.nickname
+
+        participant = self.participant_constructor(
+            recruiter_id=recruiter_name,
+            worker_id=worker_id,
+            assignment_id=assignment_id,
+            hit_id=hit_id,
+            mode=mode,
+            fingerprint_hash=fingerprint_hash,
+        )
+        self.session.add(participant)
+        return participant
+
+    def load_participant(self, assignment_id):
+        """Returns a participant object looked up by assignment_id.
+
+        Intended to allow a user to resume a session in a running experiment.
+
+        :param assignment_id: the recruiter Assignment Id
+        :type assignment_id: str
+        :returns: A ``Participant`` instance or ``None`` if there is not a
+                  single matching participant.
+        """
+        try:
+            return Participant.query.filter_by(assignment_id=assignment_id).one()
+        except (NoResultFound, MultipleResultsFound):
+            return None
 
     def data_check(self, participant):
         """Check that the data are acceptable.
@@ -664,6 +731,249 @@ class Experiment(object):
         """
         return None
 
+    def monitoring_panels(self, **kw):
+        """Provides monitoring dashboard sidebar panels.
+
+        :param \**kw: arguments passed in from the request
+        :returns: An ``OrderedDict()`` mapping panel titles to HTML strings
+                  to render in the dashboard sidebar.
+        """  # noqa
+        stats = self.monitoring_statistics(**kw)
+        panels = OrderedDict()
+        for tab in stats:
+            panels[tab] = struct_to_html(stats[tab])
+        return panels
+
+    def monitoring_statistics(self, **kw):
+        """The default data used for the monitoring panels
+
+        :param \**kw: arguments passed in from the request
+        :returns: An ``OrderedDict()`` mapping panel titles to data structures
+                  describing the experiment state.
+        """  # noqa
+        participants = Participant.query
+        nodes = Node.query
+        infos = Info.query
+
+        stats = OrderedDict()
+        stats["Participants"] = OrderedDict(
+            (
+                ("working", participants.filter_by(status="working").count()),
+                ("abandoned", participants.filter_by(status="abandoned").count()),
+                ("returned", participants.filter_by(status="returned").count()),
+                ("approved", participants.filter_by(status="approved").count()),
+            )
+        )
+
+        # Count up our networks by role
+        network_roles = self.session.query(Network.role, func.count(Network.role))
+        network_counts = network_roles.group_by(Network.role).all()
+        failed_networks = network_roles.filter(Network.failed == True)  # noqa
+        failed_counts = dict(failed_networks.group_by(Network.role).all())
+        network_stats = {}
+        for role, count in network_counts:
+            network_stats[role] = OrderedDict(
+                (("count", count), ("failed", failed_counts.get(role, 0)),)
+            )
+        stats["Networks"] = network_stats
+
+        stats["Nodes"] = OrderedDict(
+            (
+                ("count", nodes.count()),
+                ("failed", nodes.filter_by(failed=True).count()),
+            )
+        )
+
+        stats["Infos"] = OrderedDict(
+            (
+                ("count", infos.count()),
+                ("failed", infos.filter_by(failed=True).count()),
+            )
+        )
+
+        if kw.get("transformations"):
+            transformations = Transformation.query
+            stats["transformations"] = OrderedDict(
+                (
+                    ("count", transformations.count()),
+                    ("failed", transformations.filter_by(failed=True).count()),
+                )
+            )
+
+        return stats
+
+    def network_structure(self, **kw):
+        network_ids = {i[0] for i in self.session.query(distinct(Network.id)).all()}
+        if "network_roles" in kw:
+            network_ids = {
+                i[0]
+                for i in self.session.query(distinct(Network.id)).filter(
+                    Network.role.in_(kw["network_roles"])
+                )
+            }
+        if "network_ids" in kw:
+            network_ids = network_ids.intersection(int(v) for v in kw["network_ids"])
+
+        jnetworks = [
+            n.__json__()
+            for n in Network.query.filter(Network.id.in_(network_ids)).all()
+        ]
+        if "collapsed" in kw:
+            # Collapsed view shows Source nodes only
+            jnodes = [
+                n.__json__()
+                for n in Source.query.filter(Node.network_id.in_(network_ids)).all()
+            ]
+            jinfos = jparticipants = jtransformations = jvectors = []
+        else:
+            jnodes = [
+                n.__json__()
+                for n in Node.query.filter(Node.network_id.in_(network_ids)).all()
+            ]
+            jinfos = [
+                n.__json__()
+                for n in Info.query.filter(Info.network_id.in_(network_ids)).all()
+            ]
+            # We don't filter participants because they aren't directly connected to specific networks
+            jparticipants = [n.__json__() for n in Participant.query.all()]
+            jtransformations = []
+            if kw.get("transformations"):
+                jtransformations = [
+                    n.__json__()
+                    for n in Transformation.query.filter(
+                        Transformation.network_id.in_(network_ids)
+                    ).all()
+                ]
+
+            jvectors = [
+                {
+                    "origin_id": v.origin_id,
+                    "destination_id": v.destination_id,
+                    "id": v.id,
+                    "failed": v.failed,
+                }
+                for v in Vector.query.filter(Vector.network_id.in_(network_ids)).all()
+            ]
+
+        return {
+            "networks": jnetworks,
+            "nodes": jnodes,
+            "vectors": jvectors,
+            "infos": jinfos,
+            "participants": jparticipants,
+            "trans": jtransformations,
+        }
+
+    def node_visualization_html(self, object_type, obj_id):
+        """Returns a string with custom HTML visualization for a given object
+        referenced by the object base type and id.
+
+        :param object_type: The base object class name, e.g. ``Network``, ``Node``, ``Info``, ``Participant``, etc.
+        :type object_type: str
+        :param id: The ``id`` of the object
+        :type id: int
+
+        :returns: A valid HTML string to be inserted into the monitoring dashboard
+        """
+
+        model = getattr(models, object_type, None)
+        if model is not None:
+            obj = self.session.query(model).get(int(obj_id))
+            if getattr(obj, "visualization_html", None):
+                return obj.visualization_html
+        return ""
+
+    def table_data(self, **kw):
+        """Generates DataTablesJS data and configuration for the experiment. The data
+        is compiled from the models' ``__json__`` methods, and can be customized by either
+        overriding this method or using the ``json_data`` method on the model to return
+        additional serializable data.
+
+        :param \**kw: arguments passed in from the request. The ``model_type`` parameter
+                      takes a ``str`` or iterable and queries all objects of those types,
+                      ordered by ``id``.
+        :returns: Returns a ``dict`` with DataTablesJS data and configuration, filters using
+                  arbitrary keyword arguments. Should contain ``data`` and ``columns`` keys
+                  at least, with ``columns`` containing data for all fields on all returned
+                  objects.
+        """  # noqa
+        rows = []
+        found_columns = set()
+        columns = []
+        model_types = kw.get("model_type", ["Participant"])
+        if hasattr(model_types, "strip"):
+            model_types = [model_types]
+
+        for model_type in model_types:
+            model = getattr(models, model_type, None)
+            for obj in model.query.order_by(model.id).all():
+                data = obj.__json__()
+                # Add participant worker_id to data, we normally leave it out of
+                # JSON renderings
+                if model_type == "Participant":
+                    data["worker_id"] = obj.worker_id
+                rows.append(data)
+                for key in data:
+                    if key not in found_columns:
+                        columns.append({"name": key, "data": key})
+                        found_columns.add(key)
+
+        # Make sure every row has an entry for every column
+        for col in found_columns:
+            for row in rows:
+                if col not in row:
+                    row[col] = None
+
+        return {
+            "data": rows,
+            "columns": columns,
+        }
+
+    def dashboard_database_actions(self):
+        """Returns a sequence of custom actions for the database dashboard. Each action
+           must have a ``title`` and a ``name`` corresponding to a method on the
+           experiment class.
+
+           The named methods should take a single ``data`` argument
+           which will be a list of dicts representing the datatables rendering of
+           a Dallinger model object. The named methods should return a ``dict``
+           containing a ``"message"`` which will be displayed in the dashboard.
+
+           Returns a single action referencing the
+           :func:`~dallinger.experiment.Experiment.dashboard_fail`
+           method by default.
+        """
+        return [{"name": "dashboard_fail", "title": "Fail Selected"}]
+
+    def dashboard_fail(self, data):
+        """Marks matching non-failed items as failed. Items are looked up by
+        ``id`` and ``object_type`` (e.g. ``"Participant"``).
+
+        :param data: A list of dicts representing model items to be marked as failed.
+                     Each must have an ``id`` and an ``object_type``
+        :type object_type: list
+
+        :returns: Returns a ``dict`` with a ``"message"`` string indicating how
+                  many items were successfully marked as failed.
+        """
+        counts = {}
+        for entry in data:
+            obj_id = entry.get("id")
+            object_type = entry.get("object_type")
+            model = getattr(models, object_type, None)
+            if model is not None:
+                obj = self.session.query(model).get(int(obj_id))
+                if obj is not None and not obj.failed:
+                    obj.fail()
+                    counts[object_type] = counts.get(object_type, 0) + 1
+        if not counts:
+            return {"message": "No nodes found to fail"}
+        return {
+            "message": "Failed {}".format(
+                ", ".join("{} {}s".format(c, t) for t, c in sorted(counts.items()))
+            )
+        }
+
     @property
     def usable_replay_range(self):
         """The range of times that represent the active part of the experiment"""
@@ -936,6 +1246,12 @@ class Scrubber(object):
         display(self.widget())
 
 
+def is_experiment_class(cls):
+    return (
+        inspect.isclass(cls) and issubclass(cls, Experiment) and cls is not Experiment
+    )
+
+
 def load():
     """Load the active experiment."""
     initialize_experiment_package(os.getcwd())
@@ -945,12 +1261,38 @@ def load():
         except ImportError:
             from dallinger_experiment import dallinger_experiment as experiment
 
-        classes = inspect.getmembers(experiment, inspect.isclass)
-        for name, c in classes:
-            if "Experiment" in c.__bases__[0].__name__:
-                return c
+        classes = inspect.getmembers(experiment, is_experiment_class)
+
+        preferred_class = os.environ.get("EXPERIMENT_CLASS_NAME", None)
+        if preferred_class is not None:
+            try:
+                return dict(classes)[preferred_class]
+            except KeyError:
+                raise ImportError(
+                    "No experiment named {} was found".format(preferred_class)
+                )
+
+        if len(classes) > 1:
+            for name, c in classes:
+                if "Experiment" in c.__bases__[0].__name__:
+                    warnings.warn(
+                        UserWarning(
+                            "More than one potential experiment class found but no EXPERIMENT_CLASS_NAME environment variable. Picking {} from {}.".format(
+                                name, [n for (n, cls) in classes]
+                            )
+                        ),
+                        stacklevel=3,
+                    )
+                    return c
+            raise ImportError(
+                "No direct experiment subclass found in {}".format(
+                    [n for (n, cls) in classes]
+                )
+            )
+        elif len(classes) == 0:
+            raise ImportError("No experiment classes found")
         else:
-            raise ImportError
+            return classes[0][1]
     except ImportError:
         logger.error("Could not import experiment.")
         raise

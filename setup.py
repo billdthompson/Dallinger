@@ -6,7 +6,7 @@ from setuptools import setup
 setup_args = dict(
     name='dallinger',
     packages=['dallinger', 'dallinger_scripts'],
-    version="5.1.0",
+    version="6.5.0",
     description='Laboratory automation for the behavioral and social sciences',
     url='http://github.com/Dallinger/Dallinger',
     maintainer='Jordan Suchow',
@@ -21,6 +21,7 @@ setup_args = dict(
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
+        'Framework :: Pytest',
     ],
     include_package_data=True,
     zip_safe=False,
@@ -32,6 +33,7 @@ setup_args = dict(
             'dallinger_heroku_clock = dallinger_scripts.clock:main',
         ],
         'dallinger.experiments': [],
+        'pytest11': ['pytest_dallinger = dallinger.pytest_dallinger'],
     },
     extras_require={
         'data': [

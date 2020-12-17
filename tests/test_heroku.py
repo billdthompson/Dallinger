@@ -136,6 +136,24 @@ class TestHerokuUtilFunctions(object):
             heroku.sanity_check(stub_config)
         assert excinfo.match("dyno type not compatible")
 
+    def test_sanity_check_raises_on_invalid_web_dyno_combo(self, heroku, stub_config):
+        assert heroku.sanity_check(stub_config) is None
+        stub_config.set("heroku_team", u"my_team")
+        stub_config.set("dyno_type_web", u"free")
+        with pytest.raises(RuntimeError) as excinfo:
+            heroku.sanity_check(stub_config)
+        assert excinfo.match("dyno type not compatible")
+
+    def test_sanity_check_raises_on_invalid_worker_dyno_combo(
+        self, heroku, stub_config
+    ):
+        assert heroku.sanity_check(stub_config) is None
+        stub_config.set("heroku_team", u"my_team")
+        stub_config.set("dyno_type_worker", u"free")
+        with pytest.raises(RuntimeError) as excinfo:
+            heroku.sanity_check(stub_config)
+        assert excinfo.match("dyno type not compatible")
+
     def test_sanity_check_ok_when_optional_keys_absent(self, heroku, stub_config):
         del stub_config.data[0]["heroku_team"]
         assert heroku.sanity_check(stub_config) is None
@@ -186,6 +204,12 @@ class TestHerokuApp(object):
 
     def test_dashboard_url(self, app):
         assert app.dashboard_url == u"https://dashboard.heroku.com/apps/dlgr-fake-uid"
+
+    def test_dashboard_metrics_url(self, app):
+        assert (
+            app.dashboard_metrics_url
+            == u"https://dashboard.heroku.com/apps/dlgr-fake-uid/metrics"
+        )
 
     def test_bootstrap_creates_app_with_team(self, app, check_call, check_output):
         check_output.return_value = "test@example.com"

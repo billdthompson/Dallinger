@@ -63,6 +63,11 @@ columns that are common across tables:
 .. autoattribute:: dallinger.models.SharedMixin.time_of_death
     :annotation:
 
+.. autoattribute:: dallinger.models.SharedMixin.visualization_html
+    :annotation:
+
+.. automethod:: dallinger.models.SharedMixin.json_data
+
 Network
 -------
 
