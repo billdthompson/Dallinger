@@ -954,7 +954,7 @@ class BotRecruiter(Recruiter):
         logger.info("Bots don't get bonuses. Sorry, bots.")
 
     def submitted_event(self):
-        return "BotAssignmentSubmitted"
+        return "AssignmentSubmitted"
 
     def _get_bot_factory(self):
         # Must be imported at run-time
