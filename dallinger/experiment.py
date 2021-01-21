@@ -144,6 +144,12 @@ class Experiment(object):
             # Guard against subclasses replacing this with a @property
             self.public_properties = {}
 
+        # Register custom configs only once
+        config = get_config()
+        if not getattr(config, "_experiment_params_loaded", False):
+            self.extra_parameters()
+            config._experiment_params_loaded = True
+
         if session:
             self.configure()
 
@@ -160,6 +166,13 @@ class Experiment(object):
                 self.widget = None
         else:
             self.widget = module.ExperimentWidget(self)
+
+    def extra_parameters(self):
+        """Override this method to register new config variables. It is called
+        exactly once during config load or experiment initialization.
+        See :ref:`Extra Configuration <extra-configuration>` for an example.
+        """
+        pass
 
     def configure(self):
         """Load experiment configuration here"""
@@ -888,6 +901,14 @@ class Experiment(object):
             "trans": jtransformations,
         }
 
+    def node_visualization_options(self):
+        """Provides custom vis.js configuration options for the
+        Network Monitoring Dashboard.
+
+        :returns: A dict with `vis.js option values <https://visjs.github.io/vis-network/docs/network/#options>`__
+        """
+        return {}
+
     def node_visualization_html(self, object_type, obj_id):
         """Returns a string with custom HTML visualization for a given object
         referenced by the object base type and id.
@@ -1021,7 +1042,7 @@ class Experiment(object):
 
             try:
                 extra_parameters()
-                extra_parameters.loaded = True
+                config._module_params_loaded = True
             except KeyError:
                 pass
         except ImportError:
@@ -1087,11 +1108,6 @@ class Experiment(object):
         self.import_session.close()
         session.rollback()
         session.close()
-        # Remove marker preventing experiment config variables being reloaded
-        try:
-            del module.extra_parameters.loaded
-        except AttributeError:
-            pass
         config._reset(register_defaults=True)
         del sys.modules["dallinger_experiment"]
 
@@ -1283,7 +1299,10 @@ def load():
         try:
             from dallinger_experiment import experiment
         except ImportError:
-            from dallinger_experiment import dallinger_experiment as experiment
+            try:
+                from dallinger_experiment import dallinger_experiment as experiment
+            except ImportError:
+                import dallinger_experiment as experiment
 
         classes = inspect.getmembers(experiment, is_experiment_class)
 

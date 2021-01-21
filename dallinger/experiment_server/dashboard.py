@@ -192,10 +192,11 @@ class DashboardTabs(object):
 
 
 BROWSEABLE_MODELS = [
-    "Participant",
-    "Node",
     "Info",
     "Network",
+    "Node",
+    "Participant",
+    "Question",
     "Transformation",
     "Transmission",
 ]
@@ -561,6 +562,7 @@ def monitoring():
     exp = Experiment(session)
     panes = exp.monitoring_panels(**request.args.to_dict(flat=False))
     network_structure = exp.network_structure(**request.args.to_dict(flat=False))
+    vis_options = exp.node_visualization_options()
     net_roles = (
         session.query(Network.role, func.count(Network.role))
         .group_by(Network.role)
@@ -577,6 +579,7 @@ def monitoring():
         network_structure=json.dumps(network_structure, default=date_handler),
         net_roles=net_roles,
         net_ids=net_ids,
+        vis_options=json.dumps(vis_options),
     )
 
 
@@ -655,13 +658,6 @@ def prep_datatables_options(table_data):
                     "filter": key,
                     "display": display_key,
                 }
-
-            if isinstance(row[key], dict):
-                # Make sure SearchPanes can show dict values reasonably
-                row[key] = json.dumps(value, default=date_handler)
-                row[display_key] = "<code>{}</code>".format(
-                    json.dumps(value, default=date_handler, indent=True)
-                )
                 col["searchPanes"] = {
                     "orthogonal": {
                         "display": "filter",
@@ -672,15 +668,17 @@ def prep_datatables_options(table_data):
                 }
                 if "render" in col:
                     del col["render"]
+
+            if isinstance(row[key], dict):
+                # Make sure SearchPanes can show dict values reasonably
+                row[key] = json.dumps(value, default=date_handler)
+                # Add indentation
+                row[display_key] = "<code>{}</code>".format(
+                    json.dumps(value, default=date_handler, indent=True)
+                )
             elif isinstance(row[key], list):
-                # If the column is all list values allow them to be
-                # filtered separately
-                if not col.get("searchPanes", {}).get("orthogonal"):
-                    col["render"] = {
-                        "_": "{}[, ]".format(key),
-                        "sp": key,
-                    }
-                    col["searchPanes"] = {"orthogonal": "sp"}
+                # Make sure SearchPanes can show list values reasonably
+                row[key] = json.dumps(value, default=date_handler)
 
     return datatables_options
 
